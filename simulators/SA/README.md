@@ -60,10 +60,7 @@ python run.py --duration 300 --num_aircraft 2 --pallet_interval 25 --pallet_expi
 
 ## Run with the Godot visualization
 
-<video controls preload="metadata" width="100%">
-	<source src="https://minds-thu.github.io/devs_gen/static/videos/SA.mp4" type="video/mp4">
-	Your browser does not support the video tag. You can watch the demo at https://minds-thu.github.io/devs_gen/static/videos/SA.mp4.
-</video>
+<video src="https://minds-thu.github.io/devs_gen/static/videos/SA.mp4" width="100%" controls></video>
 
 1. Start an MQTT broker on `127.0.0.1:1883`.
 2. In `simulator/`, install the publisher dependency and start the MQTT bridge:
