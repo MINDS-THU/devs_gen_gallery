@@ -1,0 +1,313 @@
+{
+  "stage": "stage_1_planning",
+  "root_model_name": "SEIRD_D1",
+  "timestamp": "2026-01-27 11:04:56",
+  "plan_tree": {
+    "class_name": "SEIRD_D1",
+    "plan_phase": {
+      "type": "coupled",
+      "model_info": {
+        "class_name": "SEIRD_D1",
+        "file_path": "seird_model/devs_project/SEIRD_D1.py",
+        "logic_path": "SEIRD_D1",
+        "specification": {
+          "function": "- Purpose: simulate a closed-population SEIRD compartmental epidemic using discrete-time numerical integration.\n- Time unit: 1.0 simulation time unit = 1 day.\n- State variables (all floats):\n  - S: susceptible count\n  - E: exposed count\n  - I: infective count\n  - R: recovered count\n  - D: deceased count\n  - N: total population (constant, treated as float for calculations but initialized from int)\n- Parameters (constants during a run):\n  - beta = transmission_rate (per day)\n  - incubation_period (days)\n  - infectivity_period (days)\n  - mortality_pct = mortality (0–100, percent)\n  - dt (days per integration step)\n- Initial state at absolute time t = 0.0:\n  - S = N - initial_infective\n  - E = 0.0\n  - I = float(initial_infective)\n  - R = 0.0\n  - D = 0.0\n- Discrete-time update schedule:\n  - The model advances in fixed increments of dt until reaching simulation_time.\n  - At each step, compute all “new_*” flows from the OLD compartment values (S_old, E_old, I_old) for that step, then update compartments.\n- Transition/flow equations per step (ODE-style Euler integration):\n  - Compute new_exposed:\n    - new_exposed = (beta * S_old * I_old / N) * dt\n    - Clamp: new_exposed = min(new_exposed, S_old)\n  - Compute new_infective:\n    - new_infective = (E_old / incubation_period) * dt\n    - Clamp: new_infective = min(new_infective, E_old)\n  - Compute new_deceased and new_recovered from infectives:\n    - mortality_frac = mortality_pct / 100.0\n    - new_deceased = (I_old / infectivity_period) * mortality_frac * dt\n    - new_recovered = (I_old / infectivity_period) * (1.0 - mortality_frac) * dt\n  - Apply compartment updates:\n    - S_new = S_old - new_exposed\n    - E_new = E_old + new_exposed - new_infective\n    - I_new = I_old + new_infective - new_deceased - new_recovered\n    - R_new = R_old + new_recovered\n    - D_new = D_old + new_deceased\n- Conservation constraint (expected invariant within floating-point precision):\n  - S + E + I + R + D == N (approximately).\n- End condition:\n  - Stop updates when absolute time reaches simulation_time (or the greatest t <= simulation_time achievable by repeated dt steps; controller may handle exact final alignment).\n  - Final state is the last computed (S, E, I, R, D) at the final simulation time used for output.\n- Output formatting rule for reported values:\n  - When emitting the required final JSON object, format compartment values to 2 decimal places (rounding) in the emitted log record (keep internal state as full-precision floats).",
+          "logging": "- The core model MUST emit (via its logger) at least one JSON-serializable dict event at the END of the simulation for stdout emission by the external controller.\n- Required final event schema (single JSON object, JSONL):\n  - {\n      'time': float,              # final absolute simulation time\n      'susceptible': float,       # S at end, rounded to 2 decimals\n      'exposed': float,           # E at end, rounded to 2 decimals\n      'infective': float,         # I at end, rounded to 2 decimals\n      'recovered': float,         # R at end, rounded to 2 decimals\n      'deceased': float           # D at end, rounded to 2 decimals\n    }\n- No other log events are required by the spec; optional debug logs (e.g., per-step values, conservation error) may be produced to stderr by the controller’s logging configuration, but must not break the stdout JSONL contract.",
+          "model_init_args": [
+            {
+              "name": "test_name",
+              "type": "str",
+              "structure": "Arbitrary test case name; used for identification only (no effect on dynamics)."
+            },
+            {
+              "name": "mortality",
+              "type": "float",
+              "structure": "Mortality percentage in [0.0, 100.0]."
+            },
+            {
+              "name": "infectivity_period",
+              "type": "float",
+              "structure": "Average infectious duration in days; > 0."
+            },
+            {
+              "name": "dt",
+              "type": "float",
+              "structure": "Fixed integration time step in days; > 0."
+            },
+            {
+              "name": "incubation_period",
+              "type": "float",
+              "structure": "Average incubation duration in days; > 0."
+            },
+            {
+              "name": "total_population",
+              "type": "int",
+              "structure": "Total population N; integer >= 0."
+            },
+            {
+              "name": "initial_infective",
+              "type": "int",
+              "structure": "Initial infective count I0; integer >= 0 and should be <= total_population."
+            },
+            {
+              "name": "transmission_rate",
+              "type": "float",
+              "structure": "Transmission rate beta per day; typically >= 0."
+            },
+            {
+              "name": "simulation_time",
+              "type": "float",
+              "structure": "Total simulation duration in days; >= 0."
+            }
+          ],
+          "input_ports": [],
+          "output_ports": []
+        }
+      },
+      "children_plan": [
+        {
+          "class_name": "SEIRDIntegrator",
+          "file_path": "seird_model/devs_project/SEIRD_D1_libs/SEIRDIntegrator",
+          "logic_path": "SEIRD_D1.SEIRDIntegrator",
+          "specification": {
+            "function": "- Responsibility: own and evolve the SEIRD compartment state (S,E,I,R,D,N) using discrete-time Euler integration exactly as specified by the parent.\n- Time unit: 1.0 simulation time unit = 1 day.\n- Initialization at absolute time t=0.0:\n  - N = float(total_population)\n  - S = N - float(initial_infective)\n  - E = 0.0\n  - I = float(initial_infective)\n  - R = 0.0\n  - D = 0.0\n- Update schedule:\n  - Advance in fixed increments of dt until reaching simulation_time (or greatest t <= simulation_time achievable by repeated dt steps).\n  - At each step, compute all new_* flows from OLD values (S_old, E_old, I_old), then apply compartment updates.\n- Per-step flow equations (must match parent):\n  - new_exposed = (transmission_rate * S_old * I_old / N) * dt; clamp new_exposed = min(new_exposed, S_old)\n  - new_infective = (E_old / incubation_period) * dt; clamp new_infective = min(new_infective, E_old)\n  - mortality_frac = mortality / 100.0\n  - new_deceased = (I_old / infectivity_period) * mortality_frac * dt\n  - new_recovered = (I_old / infectivity_period) * (1.0 - mortality_frac) * dt\n  - S_new = S_old - new_exposed\n  - E_new = E_old + new_exposed - new_infective\n  - I_new = I_old + new_infective - new_deceased - new_recovered\n  - R_new = R_old + new_recovered\n  - D_new = D_old + new_deceased\n- Conservation constraint:\n  - Maintain approximate invariant S+E+I+R+D == N within floating point precision (no additional correction mandated).\n- End condition:\n  - Stop stepping when absolute time reaches simulation_time (or last t <= simulation_time by dt stepping).\n- Output responsibility:\n  - When the run ends, emit the final full-precision state and final time to sibling [SEIRDReporter: final_state_in] for formatting/log emission (reporter will round to 2 decimals for the required JSON event).",
+            "logging": "- No stdout-contract logging is required from this child.\n- Optional debug logging to stderr may be produced (must not break stdout JSONL contract), e.g.:\n  - per-step state values (S,E,I,R,D,time)\n  - conservation error (S+E+I+R+D - N)\n- If any debug logs are emitted, they must be JSON-serializable dicts via the provided Logger.",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique model instance name."
+              },
+              {
+                "name": "test_name",
+                "type": "str",
+                "structure": "Arbitrary test case name; used for identification only (no effect on dynamics)."
+              },
+              {
+                "name": "mortality",
+                "type": "float",
+                "structure": "Mortality percentage in [0.0, 100.0]."
+              },
+              {
+                "name": "infectivity_period",
+                "type": "float",
+                "structure": "Average infectious duration in days; > 0."
+              },
+              {
+                "name": "dt",
+                "type": "float",
+                "structure": "Fixed integration time step in days; > 0."
+              },
+              {
+                "name": "incubation_period",
+                "type": "float",
+                "structure": "Average incubation duration in days; > 0."
+              },
+              {
+                "name": "total_population",
+                "type": "int",
+                "structure": "Total population N; integer >= 0."
+              },
+              {
+                "name": "initial_infective",
+                "type": "int",
+                "structure": "Initial infective count I0; integer >= 0 and should be <= total_population."
+              },
+              {
+                "name": "transmission_rate",
+                "type": "float",
+                "structure": "Transmission rate beta per day; typically >= 0."
+              },
+              {
+                "name": "simulation_time",
+                "type": "float",
+                "structure": "Total simulation duration in days; >= 0."
+              }
+            ],
+            "input_ports": [],
+            "output_ports": [
+              {
+                "name": "final_state_out",
+                "type": "dict",
+                "structure": "Final simulation snapshot containing keys: 'time' (float): final absolute simulation time used (<= simulation_time), 'S' (float): susceptible count (full precision), 'E' (float): exposed count (full precision), 'I' (float): infective count (full precision), 'R' (float): recovered count (full precision), 'D' (float): deceased count (full precision), 'N' (float): total population (constant).",
+                "protocol": {
+                  "initial_state": "No pending outputs at T=0; internal state initialized at T=0 as specified.",
+                  "initial_signal": "No initial signal.",
+                  "description": "At end-of-simulation, sends exactly one dict on [SEIRDReporter: final_state_in]. No other external ports."
+                }
+              }
+            ]
+          }
+        },
+        {
+          "class_name": "SEIRDReporter",
+          "file_path": "seird_model/devs_project/SEIRD_D1_libs/SEIRDReporter",
+          "logic_path": "SEIRD_D1.SEIRDReporter",
+          "specification": {
+            "function": "- Responsibility: produce the required final JSON-serializable dict event at the END of the simulation for stdout emission by the external controller.\n- Input: receive final full-precision state snapshot from sibling integrator.\n- Formatting rule (must match parent):\n  - Emit a single JSON object (JSONL) with keys:\n    - 'time': float (final absolute simulation time)\n    - 'susceptible': float (S rounded to 2 decimals)\n    - 'exposed': float (E rounded to 2 decimals)\n    - 'infective': float (I rounded to 2 decimals)\n    - 'recovered': float (R rounded to 2 decimals)\n    - 'deceased': float (D rounded to 2 decimals)\n  - Internal received values remain full precision; only emitted values are rounded.\n- No other outputs are required.",
+            "logging": "- MUST emit (via provided Logger) at least one JSON-serializable dict event at END of simulation with EXACT schema:\n  {\n    'time': float,\n    'susceptible': float,\n    'exposed': float,\n    'infective': float,\n    'recovered': float,\n    'deceased': float\n  }\n- Values for compartments must be rounded to 2 decimal places in this emitted record.\n- No other log events are required; optional debug logs may go to stderr but must not break stdout JSONL contract.",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique model instance name."
+              },
+              {
+                "name": "test_name",
+                "type": "str",
+                "structure": "Arbitrary test case name; used for identification only (no effect on dynamics)."
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "final_state_in",
+                "type": "dict",
+                "structure": "Final simulation snapshot containing keys: 'time' (float): final absolute simulation time used, 'S' (float): susceptible count (full precision), 'E' (float): exposed count (full precision), 'I' (float): infective count (full precision), 'R' (float): recovered count (full precision), 'D' (float): deceased count (full precision), 'N' (float): total population (constant, may be unused for reporting).",
+                "protocol": {
+                  "initial_state": "Waiting for final_state_in at T=0; no buffered messages.",
+                  "initial_signal": "No initial signal.",
+                  "description": "Receives exactly one final snapshot dict from [SEIRDIntegrator: final_state_out] when integration completes; immediately logs the required final JSON event via Logger."
+                }
+              }
+            ],
+            "output_ports": []
+          }
+        }
+      ],
+      "coupling_specification": "Children classes: SEIRDIntegrator, SEIRDReporter.\n\nInstantiate:\n- SEIRDIntegrator as integrator\n- SEIRDReporter as reporter\n\nInternal Coupling (IC):\n- integrator.final_state_out -> reporter.final_state_in\n\nExternal Input Coupling (EIC):\n- None (parent SEIRD_D1 has no input ports).\n\nExternal Output Coupling (EOC):\n- None (parent SEIRD_D1 has no output ports; required output is via logger at end).\n\nCold-start deadlock prevention:\n- No cyclic waiting: integrator runs autonomously from initialized state at T=0 and, upon completion, pushes one final_state_out message to reporter. Reporter is purely reactive and only waits for that message."
+    },
+    "code_phase": null,
+    "children": [
+      {
+        "class_name": "SEIRDIntegrator",
+        "plan_phase": {
+          "type": "atomic",
+          "model_info": {
+            "class_name": "SEIRDIntegrator",
+            "file_path": "seird_model/devs_project/SEIRD_D1_libs/SEIRDIntegrator.py",
+            "logic_path": "SEIRD_D1.SEIRDIntegrator",
+            "specification": {
+              "function": "- Responsibility: own and evolve the SEIRD compartment state (S,E,I,R,D,N) using discrete-time Euler integration exactly as specified by the parent.\n- Time unit: 1.0 simulation time unit = 1 day.\n- Initialization at absolute time t=0.0:\n  - N = float(total_population)\n  - S = N - float(initial_infective)\n  - E = 0.0\n  - I = float(initial_infective)\n  - R = 0.0\n  - D = 0.0\n- Update schedule:\n  - Advance in fixed increments of dt until reaching simulation_time (or greatest t <= simulation_time achievable by repeated dt steps).\n  - At each step, compute all new_* flows from OLD values (S_old, E_old, I_old), then apply compartment updates.\n- Per-step flow equations (must match parent):\n  - new_exposed = (transmission_rate * S_old * I_old / N) * dt; clamp new_exposed = min(new_exposed, S_old)\n  - new_infective = (E_old / incubation_period) * dt; clamp new_infective = min(new_infective, E_old)\n  - mortality_frac = mortality / 100.0\n  - new_deceased = (I_old / infectivity_period) * mortality_frac * dt\n  - new_recovered = (I_old / infectivity_period) * (1.0 - mortality_frac) * dt\n  - S_new = S_old - new_exposed\n  - E_new = E_old + new_exposed - new_infective\n  - I_new = I_old + new_infective - new_deceased - new_recovered\n  - R_new = R_old + new_recovered\n  - D_new = D_old + new_deceased\n- Conservation constraint:\n  - Maintain approximate invariant S+E+I+R+D == N within floating point precision (no additional correction mandated).\n- End condition:\n  - Stop stepping when absolute time reaches simulation_time (or last t <= simulation_time by dt stepping).\n- Output responsibility:\n  - When the run ends, emit the final full-precision state and final time to sibling [SEIRDReporter: final_state_in] for formatting/log emission (reporter will round to 2 decimals for the required JSON event).",
+              "logging": "- No stdout-contract logging is required from this child.\n- Optional debug logging to stderr may be produced (must not break stdout JSONL contract), e.g.:\n  - per-step state values (S,E,I,R,D,time)\n  - conservation error (S+E+I+R+D - N)\n- If any debug logs are emitted, they must be JSON-serializable dicts via the provided Logger.",
+              "model_init_args": [
+                {
+                  "name": "name",
+                  "type": "str",
+                  "structure": "Unique model instance name."
+                },
+                {
+                  "name": "test_name",
+                  "type": "str",
+                  "structure": "Arbitrary test case name; used for identification only (no effect on dynamics)."
+                },
+                {
+                  "name": "mortality",
+                  "type": "float",
+                  "structure": "Mortality percentage in [0.0, 100.0]."
+                },
+                {
+                  "name": "infectivity_period",
+                  "type": "float",
+                  "structure": "Average infectious duration in days; > 0."
+                },
+                {
+                  "name": "dt",
+                  "type": "float",
+                  "structure": "Fixed integration time step in days; > 0."
+                },
+                {
+                  "name": "incubation_period",
+                  "type": "float",
+                  "structure": "Average incubation duration in days; > 0."
+                },
+                {
+                  "name": "total_population",
+                  "type": "int",
+                  "structure": "Total population N; integer >= 0."
+                },
+                {
+                  "name": "initial_infective",
+                  "type": "int",
+                  "structure": "Initial infective count I0; integer >= 0 and should be <= total_population."
+                },
+                {
+                  "name": "transmission_rate",
+                  "type": "float",
+                  "structure": "Transmission rate beta per day; typically >= 0."
+                },
+                {
+                  "name": "simulation_time",
+                  "type": "float",
+                  "structure": "Total simulation duration in days; >= 0."
+                }
+              ],
+              "input_ports": [],
+              "output_ports": [
+                {
+                  "name": "final_state_out",
+                  "type": "dict",
+                  "structure": "Final simulation snapshot containing keys: 'time' (float): final absolute simulation time used (<= simulation_time), 'S' (float): susceptible count (full precision), 'E' (float): exposed count (full precision), 'I' (float): infective count (full precision), 'R' (float): recovered count (full precision), 'D' (float): deceased count (full precision), 'N' (float): total population (constant).",
+                  "protocol": {
+                    "initial_state": "No pending outputs at T=0; internal state initialized at T=0 as specified.",
+                    "initial_signal": "No initial signal.",
+                    "description": "At end-of-simulation, sends exactly one dict on [SEIRDReporter: final_state_in]. No other external ports."
+                  }
+                }
+              ]
+            }
+          },
+          "children_plan": [],
+          "coupling_specification": null
+        },
+        "code_phase": null,
+        "children": []
+      },
+      {
+        "class_name": "SEIRDReporter",
+        "plan_phase": {
+          "type": "atomic",
+          "model_info": {
+            "class_name": "SEIRDReporter",
+            "file_path": "seird_model/devs_project/SEIRD_D1_libs/SEIRDReporter.py",
+            "logic_path": "SEIRD_D1.SEIRDReporter",
+            "specification": {
+              "function": "- Responsibility: produce the required final JSON-serializable dict event at the END of the simulation for stdout emission by the external controller.\n- Input: receive final full-precision state snapshot from sibling integrator.\n- Formatting rule (must match parent):\n  - Emit a single JSON object (JSONL) with keys:\n    - 'time': float (final absolute simulation time)\n    - 'susceptible': float (S rounded to 2 decimals)\n    - 'exposed': float (E rounded to 2 decimals)\n    - 'infective': float (I rounded to 2 decimals)\n    - 'recovered': float (R rounded to 2 decimals)\n    - 'deceased': float (D rounded to 2 decimals)\n  - Internal received values remain full precision; only emitted values are rounded.\n- No other outputs are required.",
+              "logging": "- MUST emit (via provided Logger) at least one JSON-serializable dict event at END of simulation with EXACT schema:\n  {\n    'time': float,\n    'susceptible': float,\n    'exposed': float,\n    'infective': float,\n    'recovered': float,\n    'deceased': float\n  }\n- Values for compartments must be rounded to 2 decimal places in this emitted record.\n- No other log events are required; optional debug logs may go to stderr but must not break stdout JSONL contract.",
+              "model_init_args": [
+                {
+                  "name": "name",
+                  "type": "str",
+                  "structure": "Unique model instance name."
+                },
+                {
+                  "name": "test_name",
+                  "type": "str",
+                  "structure": "Arbitrary test case name; used for identification only (no effect on dynamics)."
+                }
+              ],
+              "input_ports": [
+                {
+                  "name": "final_state_in",
+                  "type": "dict",
+                  "structure": "Final simulation snapshot containing keys: 'time' (float): final absolute simulation time used, 'S' (float): susceptible count (full precision), 'E' (float): exposed count (full precision), 'I' (float): infective count (full precision), 'R' (float): recovered count (full precision), 'D' (float): deceased count (full precision), 'N' (float): total population (constant, may be unused for reporting).",
+                  "protocol": {
+                    "initial_state": "Waiting for final_state_in at T=0; no buffered messages.",
+                    "initial_signal": "No initial signal.",
+                    "description": "Receives exactly one final snapshot dict from [SEIRDIntegrator: final_state_out] when integration completes; immediately logs the required final JSON event via Logger."
+                  }
+                }
+              ],
+              "output_ports": []
+            }
+          },
+          "children_plan": [],
+          "coupling_specification": null
+        },
+        "code_phase": null,
+        "children": []
+      }
+    ]
+  },
+  "flat_registry_view": {},
+  "stage_report": ""
+}

@@ -1,0 +1,20 @@
+# OTrain
+
+Ottawa O-Train simulator item.
+
+## Contents
+
+- `simulator/` - self-contained generated simulator package
+- `godot/` - optional visualization project when available
+
+## Run
+
+```bash
+cd simulator
+python run.py --simulate_time 00:10:00:000
+```
+
+This simulator package was generated with DEVS-Gen from `devs_gen_code`:
+https://github.com/czyarl/devs_gen_code
+
+The original generated package notes are preserved in `simulator/README.md`.

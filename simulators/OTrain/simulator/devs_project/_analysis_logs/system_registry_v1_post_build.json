@@ -1,0 +1,1004 @@
+[
+  {
+    "class_name": "PassengerInitGenerator",
+    "file_path": "otrain_model/devs_project/OTrain_libs/PassengerGenerationSystem_libs/PassengerInitGenerator.py",
+    "logic_path": "OTrain.PassengerGenerationSystem.PassengerInitGenerator",
+    "specification": {
+      "function": "Atomic DEVS model that generates a one-time set of initialization passengers for all 5 stations.\n\nWorkflow / state logic:\n- initialize():\n  - Clears internal buffers/counters.\n  - Logs \"Model Initialized\".\n  - Schedules an internal transition by entering phase WAIT_INIT for sigma=init_passenger_time_seconds.\n  - NOTE: This class overrides hold_in(); when entering WAIT_INIT it immediately prepares the payload (5 passenger records, one per station) and logs a JSONL \"passenger_generated\" event per prepared passenger.\n- hold_in(phase, sigma):\n  - Delegates to Atomic.hold_in.\n  - If phase == \"WAIT_INIT\":\n    - Builds exactly one passenger per station in param['stations'] (defaults to [1..5]).\n    - For each station_id:\n      - Chooses a random destination from other station IDs.\n      - Builds passenger record {passenger_id:0, passenger_num:0, origin:station_id, destination:dest}.\n      - Validates origin match and destination != origin; on failure logs a \"Validation Error\" with log_type=ERROR and skips emitting that passenger.\n      - Appends passenger to _pending_outputs and increments _emitted_total.\n      - Logs required JSONL \"passenger_generated\" event with time=get_current_time()+sigma.\n- lambdaf():\n  - If phase == WAIT_INIT: emits every dict in _pending_outputs on output port passenger_out.\n- deltint():\n  - If phase == WAIT_INIT: clears _pending_outputs and goes to DONE with sigma=inf (passive forever).\n  - Otherwise ensures DONE with sigma=inf.\n- deltext(e):\n  - No input ports. Keeps current phase and reduces remaining time by elapsed e (never below 0).\n- exit():\n  - Logs \"Model Finalized\" with total number of initialization passengers actually emitted (i.e., prepared without validation errors).\n\nCommunication protocol (outputs):\n- No output at T=0.\n- At T=init_passenger_time_seconds: emits up to 5 passenger_out messages (one per station), then never emits again.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'init_passenger_time_seconds': float, 'stations': list[int]}\", \"description\": \"Emitted during __init__ after ports/params are set. Records the configured initialization delay and the station IDs targeted for initialization passengers.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Initialized', 'init_passenger_time_seconds': float}\", \"description\": \"Emitted in initialize() when the model is reset and before scheduling WAIT_INIT.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'time': float, 'event': 'passenger_generated', 'entity_type': 'passenger_generator', 'station_id': int, 'station': str, 'payload': {'passenger_id': int, 'passenger_num': int, 'origin': int, 'destination': int}}\", \"description\": \"Emitted once per prepared initialization passenger when entering WAIT_INIT (inside overridden hold_in). time is computed as get_current_time() + sigma (where sigma is init_passenger_time_seconds at scheduling time). payload is the passenger record sent later on passenger_out at the internal event.\"}, {\"log_type\": \"ERROR\", \"msg\": \"{'event': 'Validation Error', 'reason': str, 'station_id': int, 'passenger': dict}\", \"description\": \"Emitted in overridden hold_in() if a generated passenger violates constraints. reason is one of: 'origin_mismatch' or 'destination_equals_origin'. The invalid passenger is skipped (not added to outputs).\"}, {\"log_type\": \"RESULT\", \"msg\": \"{'event': 'Model Finalized', 'total_init_passengers_emitted': int}\", \"description\": \"Emitted in exit(). total_init_passengers_emitted equals the count of passengers successfully prepared for emission (expected 5 if no validation errors).\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model instance name passed to Atomic.__init__()."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. If None, this atomic model is treated as a root model. Stored in self.parent; not otherwise used for behavior."
+        },
+        {
+          "name": "init_passenger_time_seconds",
+          "type": "float",
+          "structure": "Delay (seconds) from initialization until the one-time emission of initialization passengers. Coerced to float via float(init_passenger_time_seconds). Default: 0.5."
+        }
+      ],
+      "input_ports": [],
+      "output_ports": [
+        {
+          "name": "passenger_out",
+          "type": "dict",
+          "structure": "Passenger record for an initialization passenger.\nKeys:\n- passenger_id (int): always 0.\n- passenger_num (int): always 0.\n- origin (int): station id in {1,2,3,4,5}.\n- destination (int): station id in {1,2,3,4,5} and must be != origin.",
+          "protocol": {
+            "initial_state": "No buffered passengers at T=0; model starts by scheduling WAIT_INIT for init_passenger_time_seconds.",
+            "initial_signal": "No initial signal at T=0. First emission occurs at T=init_passenger_time_seconds.",
+            "description": "At the internal event time (end of WAIT_INIT), lambdaf emits one passenger_out per station (intended 5 total). After the emission, deltint transitions the model to DONE and it remains passive forever (sigma=inf)."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "PerStationStochasticProcess",
+    "file_path": "otrain_model/devs_project/OTrain_libs/PassengerGenerationSystem_libs/PassengerStochasticGenerator_libs/PerStationStochasticProcess.py",
+    "logic_path": "OTrain.PassengerGenerationSystem.PassengerStochasticGenerator.PerStationStochasticProcess",
+    "specification": {
+      "function": "Atomic DEVS model that generates passengers for exactly one origin station via a stochastic inter-arrival process.\n\nState machine / workflow:\n- initialize():\n  - Validates configuration:\n    - origin_station_id must be in 1..5 (must exist in station_id_to_name).\n    - gen_max_minutes >= gen_min_minutes.\n    - init_passenger_time_seconds >= 0.\n  - On invalid config: logs a PROCESS/ERROR \"Config Error\" event and remains PASSIVE forever (hold_in(\"PASSIVE\", inf)).\n  - On valid config: resets local counter passenger_num to 0 and schedules a start gate with hold_in(\"WAIT_START\", init_passenger_time_seconds).\n\n- WAIT_START (time advance = init_passenger_time_seconds):\n  - No output.\n  - At internal transition: samples an inter-arrival interval (Normal(mean,std) minutes, clamped to [min,max], converted to seconds) and enters WAIT_NEXT for that duration.\n\n- WAIT_NEXT (time advance = sampled interval):\n  - No output.\n  - At internal transition: prepares exactly one passenger payload:\n    - passenger_num increments by 1.\n    - destination chosen uniformly from {1..5} excluding origin.\n    - passenger_id computed as passenger_num*100 + origin*10 + destination.\n    - Validates payload (destination in 1..5 and != origin). If invalid, resamples interval and stays in WAIT_NEXT.\n    - If valid, transitions to EMIT with 0 delay.\n\n- EMIT (time advance = 0):\n  - lambdaf() outputs exactly one passenger dict on passenger_out and logs a RESULT event \"passenger_generated\" with required JSON schema.\n  - At internal transition: samples next interval and returns to WAIT_NEXT.\n\nExternal transition deltext(e):\n- No input ports; it only discounts elapsed time and keeps the current phase with remaining time (hold_in(current_phase, max(ta()-e,0))).\n\nExit:\n- Logs \"Model Finalized\" with generated_count (passenger_num).\n\nRandomness/protocol notes:\n- Inter-arrival sampling: random.gauss(gen_mean_minutes, gen_std_minutes), clamped to [gen_min_minutes, gen_max_minutes], converted to seconds and rounded to nearest integer.\n- Destination selection: uniform random among stations 1..5 excluding origin.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"dict with keys: event='Model Created' (str), model (str), origin_station_id (int), gen_mean_minutes (float), gen_std_minutes (float), gen_min_minutes (float), gen_max_minutes (float), init_passenger_time_seconds (float), time (float)\", \"description\": \"Emitted at construction time (__init__) after ports/config are set.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"dict with keys: event='Model Initialized' (str), origin_station_id (int), passenger_num (int), time (float)\", \"description\": \"Emitted in initialize() after successful validation and local state reset.\"}, {\"log_type\": \"ERROR\", \"msg\": \"dict with keys: event='Config Error' (str), reason (str: one of {'origin_station_id_out_of_range','gen_max_minutes_less_than_gen_min_minutes','init_passenger_time_seconds_negative'}), plus relevant numeric fields depending on reason, and time (float)\", \"description\": \"Emitted in initialize() on invalid configuration; model then remains PASSIVE forever.\"}, {\"log_type\": \"RESULT\", \"msg\": \"dict (JSONL schema) with keys: time (float seconds), event='passenger_generated' (str), entity_type='passenger_generator' (str), station_id (int), station (str), payload (dict passenger record with passenger_id, passenger_num, origin, destination)\", \"description\": \"Emitted in lambdaf() when phase=='EMIT' and a valid payload exists; corresponds to each passenger emitted on passenger_out.\"}, {\"log_type\": \"RESULT\", \"msg\": \"dict with keys: event='Model Finalized' (str), origin_station_id (int), generated_count (int), time (float)\", \"description\": \"Emitted in exit() when the model is finalized; summarizes total generated passengers (passenger_num).\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model instance name used by the DEVS engine and in logs as \"model\"."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. May be None if used as a root model. Stored as self.parent; not otherwise used for logic."
+        },
+        {
+          "name": "origin_station_id",
+          "type": "int",
+          "structure": "Origin station id for this generator instance. Must be one of {1,2,3,4,5}. Used to (a) select station name for logging, (b) exclude itself from destination choices, and (c) form passenger_id."
+        },
+        {
+          "name": "gen_mean_minutes",
+          "type": "float",
+          "structure": "Mean of Normal distribution for passenger inter-arrival times in minutes. Default 5.0. Used by random.gauss(mean,std)."
+        },
+        {
+          "name": "gen_std_minutes",
+          "type": "float",
+          "structure": "Standard deviation of Normal distribution for passenger inter-arrival times in minutes. Default 5.0. Used by random.gauss(mean,std)."
+        },
+        {
+          "name": "gen_min_minutes",
+          "type": "float",
+          "structure": "Lower clamp bound for sampled inter-arrival time in minutes. Default 1.0. Must be <= gen_max_minutes or model logs config error and stays PASSIVE."
+        },
+        {
+          "name": "gen_max_minutes",
+          "type": "float",
+          "structure": "Upper clamp bound for sampled inter-arrival time in minutes. Default 9.0. Must be >= gen_min_minutes or model logs config error and stays PASSIVE."
+        },
+        {
+          "name": "init_passenger_time_seconds",
+          "type": "float",
+          "structure": "Start gate time threshold in seconds. Model will not emit any passenger before this time elapses; first generation occurs after WAIT_START plus one sampled interval. Must be >= 0.0 or model logs config error and stays PASSIVE."
+        }
+      ],
+      "input_ports": [],
+      "output_ports": [
+        {
+          "name": "passenger_out",
+          "type": "dict",
+          "structure": "Passenger record dict emitted once per successful generation.\nKeys:\n- passenger_id (int): Computed as passenger_num*100 + origin*10 + destination.\n- passenger_num (int): Sequential counter for this generator instance (starts at 1 on first emission).\n- origin (int): Origin station id (1..5), equals origin_station_id for this instance.\n- destination (int): Destination station id (1..5), uniformly chosen excluding origin.",
+          "protocol": {
+            "initial_state": "No initial credits/tokens. Internal state starts as PASSIVE/inf in __init__, then initialize() schedules WAIT_START for init_passenger_time_seconds.",
+            "initial_signal": "No initial signal (no output at time 0).",
+            "description": "Emission protocol: after initialize(), wait init_passenger_time_seconds (WAIT_START) then wait one sampled inter-arrival interval (WAIT_NEXT). At each subsequent WAIT_NEXT expiry, prepare one passenger; if valid, enter EMIT (0 delay) and output exactly one dict on passenger_out, then resample interval and return to WAIT_NEXT. Invalid prepared payloads (should be rare) are dropped and the model reschedules WAIT_NEXT without emitting."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "PassengerStochasticGenerator",
+    "file_path": "otrain_model/devs_project/OTrain_libs/PassengerGenerationSystem_libs/PassengerStochasticGenerator.py",
+    "logic_path": "OTrain.PassengerGenerationSystem.PassengerStochasticGenerator",
+    "specification": {
+      "function": "Coupled DEVS container that instantiates and aggregates five independent PerStationStochasticProcess sub-models (one per station_id in 1..5) and exposes a single system-boundary output port.\n\nWorkflow / structure:\n- Construction (__init__):\n  - Creates one output port: passenger_out (dict).\n  - Instantiates 5 submodels:\n    - PerStationStochasticProcess instance name='gen_station_1' with origin_station_id=1\n    - PerStationStochasticProcess instance name='gen_station_2' with origin_station_id=2\n    - PerStationStochasticProcess instance name='gen_station_3' with origin_station_id=3\n    - PerStationStochasticProcess instance name='gen_station_4' with origin_station_id=4\n    - PerStationStochasticProcess instance name='gen_station_5' with origin_station_id=5\n    Each submodel receives the same stochastic timing parameters (gen_mean_minutes, gen_std_minutes, gen_min_minutes, gen_max_minutes) and init_passenger_time_seconds.\n  - Registers submodels as components.\n  - Defines EOC couplings only (no inputs, no internal couplings): each submodel's output['passenger_out'] is coupled to this coupled model's output['passenger_out'].\n  - Logs a container-level PROCESS \"Model Created\" event.\n\nCommunication protocol:\n- Start: there is no explicit start signal from this coupled model; submodels start according to their own initialize()/timing rules.\n- Send/forward: whenever any submodel emits a passenger record on its passenger_out, this coupled model forwards it through the EOC couplings to the system passenger_out.\n- Receive: none (no input ports).\n- End: no explicit termination behavior in this coupled model; submodels handle their own exit logic/logging.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"dict with keys: event='Model Created' (str), gen_mean_minutes (float), gen_std_minutes (float), gen_min_minutes (float), gen_max_minutes (float), init_passenger_time_seconds (float), stations (list[int] == [1,2,3,4,5]), time (float seconds from get_current_time())\", \"description\": \"Emitted once at the end of __init__ after ports, submodels, and couplings are created; container-level creation log.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model instance name passed to Coupled.__init__(name) and used by the DEVS engine and logger context."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to parent coupled model; stored as self.parent. If None, this model is intended to be used as a root model."
+        },
+        {
+          "name": "gen_mean_minutes",
+          "type": "float",
+          "structure": "Passenger inter-arrival Normal distribution mean in minutes. Passed unchanged to each PerStationStochasticProcess instance."
+        },
+        {
+          "name": "gen_std_minutes",
+          "type": "float",
+          "structure": "Passenger inter-arrival Normal distribution standard deviation in minutes. Passed unchanged to each PerStationStochasticProcess instance."
+        },
+        {
+          "name": "gen_min_minutes",
+          "type": "float",
+          "structure": "Lower clamp bound for sampled inter-arrival times (minutes). Passed unchanged to each PerStationStochasticProcess instance."
+        },
+        {
+          "name": "gen_max_minutes",
+          "type": "float",
+          "structure": "Upper clamp bound for sampled inter-arrival times (minutes). Passed unchanged to each PerStationStochasticProcess instance."
+        },
+        {
+          "name": "init_passenger_time_seconds",
+          "type": "float",
+          "structure": "Start gate time in seconds after which per-station generation processes are considered to start (i.e., their initial waiting gate). Passed unchanged to each PerStationStochasticProcess instance."
+        }
+      ],
+      "input_ports": [],
+      "output_ports": [
+        {
+          "name": "passenger_out",
+          "type": "dict",
+          "structure": "Passenger record dict emitted by any of the five station generators.\nKeys:\n- passenger_id (int): Computed in submodel as passenger_num*100 + origin*10 + destination.\n- passenger_num (int): Per-origin sequential counter (>=1).\n- origin (int): Origin station id in [1..5].\n- destination (int): Destination station id in [1..5] and != origin.",
+          "protocol": {
+            "initial_state": "No initial tokens/credits. Port exists immediately after __init__ but no output is produced by this coupled model itself.",
+            "initial_signal": "No initial signal at t=0.",
+            "description": "Forwarding-only protocol (EOC couplings): each PerStationStochasticProcess emits passenger dicts on its passenger_out according to its own internal stochastic schedule; those dicts are forwarded unchanged to PassengerStochasticGenerator.passenger_out as they occur. No arbitration/merging logic beyond standard DEVS coupling semantics."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "PassengerGenerationSystem",
+    "file_path": "otrain_model/devs_project/OTrain_libs/PassengerGenerationSystem.py",
+    "logic_path": "OTrain.PassengerGenerationSystem",
+    "specification": {
+      "function": "Coupled DEVS model that owns all passenger generation logic for 5 stations by composing two submodels and forwarding their outputs through a single system-boundary output port.\n\nComposition / workflow:\n- Submodels (instances and classes):\n  - PassengerInitGenerator instance name=\"init_generator\": emits a one-time initialization passenger set at t=init_passenger_time_seconds (intended exactly 1 per station, 5 total).\n  - PassengerStochasticGenerator instance name=\"stochastic_generator\": emits ongoing passenger records from 5 independent station processes.\n- Ports:\n  - Creates one output port passenger_out.\n- Couplings:\n  - EOC only (no inputs, no internal couplings declared here):\n    - init_generator.output['passenger_out'] -> PassengerGenerationSystem.output['passenger_out']\n    - stochastic_generator.output['passenger_out'] -> PassengerGenerationSystem.output['passenger_out']\n- Protocol:\n  - Start: no explicit start signal; submodels begin according to their own initialize/timing.\n  - Send/forward: any passenger dict emitted by either submodel is forwarded unchanged on passenger_out.\n  - Receive: none (no input ports).\n  - End: no explicit termination logic; relies on submodels.\n\nInternal fixed parameters (hardcoded, not __init__ args):\n- self.param['stations'] = [1,2,3,4,5]\n- self.param['station_names'] mapping {1:'Bayview',2:'Carling',3:'Carleton',4:'Confed',5:'Greenboro'}",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'gen_mean_minutes': float, 'gen_std_minutes': float, 'gen_min_minutes': float, 'gen_max_minutes': float, 'init_passenger_time_seconds': float, 'time': float}\", \"description\": \"Emitted once at the end of __init__ after ports, submodels, and couplings are created. time is the current simulation time from get_current_time(). Note: this model does not log passenger_generated events; submodels handle those.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model instance name passed to Coupled.__init__(name)."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to the parent coupled model. If None, this model is a root model. Stored in self.parent; not used further in logic."
+        },
+        {
+          "name": "gen_mean_minutes",
+          "type": "float",
+          "structure": "Passenger inter-arrival Normal distribution mean in minutes for ongoing stochastic generation. Default 5.0. Coerced via float(gen_mean_minutes) before passing to PassengerStochasticGenerator."
+        },
+        {
+          "name": "gen_std_minutes",
+          "type": "float",
+          "structure": "Passenger inter-arrival Normal distribution standard deviation in minutes for ongoing stochastic generation. Default 5.0. Coerced via float(gen_std_minutes) before passing to PassengerStochasticGenerator."
+        },
+        {
+          "name": "gen_min_minutes",
+          "type": "float",
+          "structure": "Lower clamp bound (minutes) for sampled inter-arrival times. Default 1.0. Coerced via float(gen_min_minutes) before passing to PassengerStochasticGenerator."
+        },
+        {
+          "name": "gen_max_minutes",
+          "type": "float",
+          "structure": "Upper clamp bound (minutes) for sampled inter-arrival times. Default 9.0. Coerced via float(gen_max_minutes) before passing to PassengerStochasticGenerator."
+        },
+        {
+          "name": "init_passenger_time_seconds",
+          "type": "float",
+          "structure": "Time (seconds) at which initialization passengers are created/emitted by PassengerInitGenerator; also passed as a start gate to PassengerStochasticGenerator. Default 0.5. Coerced via float(init_passenger_time_seconds) when passed to submodels and logged."
+        }
+      ],
+      "input_ports": [],
+      "output_ports": [
+        {
+          "name": "passenger_out",
+          "type": "dict",
+          "structure": "Passenger record forwarded from either submodel.\nKeys:\n- passenger_id (int): Unique passenger id. For initialization passengers, always 0.\n- passenger_num (int): Sequential counter per origin (0 for initialization, >=1 for ongoing).\n- origin (int): Origin station id in [1..5].\n- destination (int): Destination station id in [1..5] and must be != origin.",
+          "protocol": {
+            "initial_state": "Port exists after __init__. No internal buffering or credits; this coupled model only forwards outputs produced by submodels.",
+            "initial_signal": "No output at t=0 from this coupled model itself. First possible output occurs when a submodel emits (e.g., at t=init_passenger_time_seconds for init_generator).",
+            "description": "Forwarding-only (EOC couplings): any dict emitted on init_generator.passenger_out or stochastic_generator.passenger_out is forwarded unchanged to PassengerGenerationSystem.passenger_out."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "TrainMovementSystem",
+    "file_path": "otrain_model/devs_project/OTrain_libs/TrainMovementSystem.py",
+    "logic_path": "OTrain.TrainMovementSystem",
+    "specification": {
+      "function": "Atomic DEVS model that generates a repeating single-train arrival schedule along a fixed cyclic route.\n\nWorkflow / DEVS behavior:\n- Initialization (initialize):\n  - Sets route_index=0 and prepares first output payload for station_id=1, direction=0.\n  - Schedules an immediate internal event with hold_in(\"EMIT_ARRIVAL\", 0.0) so the first arrival is emitted at simulation time T=0.0.\n- Output function (lambdaf):\n  - When phase==\"EMIT_ARRIVAL\", emits one dict on output port train_arrival_out.\n  - Also logs a required JSONL-style event object with event=\"train_arrival\" including station_id, station name (via station_map), and payload{station,direction}.\n- Internal transition (deltint):\n  - After an emission, increments total_arrivals_emitted.\n  - Advances route_index cyclically through the fixed route_sequence.\n  - Prepares the next payload and schedules the next emission after travel_time_seconds (sigma=max(0, travel_time_seconds)) via hold_in(\"EMIT_ARRIVAL\", sigma).\n- External transition (deltext):\n  - No input ports; preserves current phase and decreases remaining time by elapsed e (re-hold_in(phase, remaining)).\n- Finalization (exit):\n  - Logs a summary with total_arrivals_emitted.\n\nFixed internal parameters (hardcoded):\n- station_map: {1:\"Bayview\",2:\"Carling\",3:\"Carleton\",4:\"Confed\",5:\"Greenboro\"}\n- route_sequence (repeats cyclically):\n  [{station_id:1,direction:0},{2,0},{3,0},{4,0},{5,1},{4,1},{3,1},{2,1},{1,0}]\nWhere direction: 0=southbound, 1=northbound.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{ 'event': 'Model Created', 'travel_time_seconds': float, 'route_sequence': list[dict], 'station_map': dict[int,str], 'time': float }\\nroute_sequence element structure: { 'station_id': int (1..5), 'direction': int (0|1) }\\nstation_map keys: 1..5 mapping to 'Bayview','Carling','Carleton','Confed','Greenboro'\", \"description\": \"Emitted in __init__ after ports/state/params are set. Records configuration and current simulation time.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{ 'event': 'Model Initialized', 'initial_route_index': int, 'time': float }\", \"description\": \"Emitted in initialize() after setting route_index=0 and preparing the first payload; before scheduling immediate emission.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{ 'time': float, 'event': 'train_arrival', 'entity_type': 'train', 'station_id': int (1..5), 'station': str, 'payload': { 'station': int (same as station_id), 'direction': int (0|1) } }\", \"description\": \"Emitted in lambdaf() whenever an arrival is output (phase==\\\"EMIT_ARRIVAL\\\"). This is the required JSONL event object for downstream logging/analysis.\"}, {\"log_type\": \"RESULT\", \"msg\": \"{ 'event': 'Model Finalized', 'total_arrivals_emitted': int, 'time': float }\", \"description\": \"Emitted in exit() when the model finalizes. Summarizes how many arrivals were emitted and the final simulation time.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name passed to Atomic base class constructor."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. If None, this atomic model is used as a root model. Stored as self.parent; not otherwise used in logic here."
+        },
+        {
+          "name": "travel_time_seconds",
+          "type": "float",
+          "structure": "Constant travel time in seconds between consecutive route steps (i.e., time between consecutive emissions). Converted to float and used as sigma in deltint: sigma=max(0.0, travel_time_seconds). Default 225.0."
+        }
+      ],
+      "input_ports": [],
+      "output_ports": [
+        {
+          "name": "train_arrival_out",
+          "type": "dict",
+          "structure": "Train arrival notification dict.\nKeys:\n- station_id (int): Station ID in 1..5 indicating arrival station.\n- direction (int): 0 for Southbound (Bayview→Greenboro), 1 for Northbound (Greenboro→Bayview).",
+          "protocol": {
+            "initial_state": "On initialize(), route_index=0 and _next_out_payload is prepared for the first route step. The model schedules an immediate internal event: phase=\"EMIT_ARRIVAL\", sigma=0.0.",
+            "initial_signal": "At T=0.0, lambdaf emits {'station_id': 1, 'direction': 0} on train_arrival_out.",
+            "description": "Emission protocol is time-driven only (no inputs). Each time phase==\"EMIT_ARRIVAL\", one dict is emitted. After each emission, deltint advances to the next step in the fixed cyclic route_sequence and schedules the next emission after travel_time_seconds (clamped to >=0)."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "StationQueueSystem",
+    "file_path": "otrain_model/devs_project/OTrain_libs/StationQueueSystem.py",
+    "logic_path": "OTrain.StationQueueSystem",
+    "specification": {
+      "function": "Atomic DEVS model implementing per-station FIFO waiting queues for stations 1..5.\n\nCore responsibilities and workflow:\n- Maintains internal state: queue_by_station: dict[int, list[dict]] where each station_id maps to a FIFO list of passenger records.\n- External transition (deltext):\n  - Passenger enqueue path:\n    - For each message on passenger_in, validates required keys and types, validates origin/destination are station IDs 1..5 and destination != origin.\n    - If valid, appends a normalized passenger dict to queue_by_station[origin] (FIFO order).\n    - If invalid, passenger is rejected (logged) and not enqueued.\n  - Dequeue request path:\n    - For each message on dequeue_request_in, processes request for station_id.\n    - If station_id invalid, prepares an empty response with station_id=-1 (or the int if provided but out of range), has_passenger=False.\n    - If station queue non-empty, pops head-of-line (pop(0)) and prepares response with has_passenger=True and passenger dict.\n    - If station queue empty, prepares response with has_passenger=False and passenger={}.\n    - If multiple dequeue requests arrive at the same simulation time, only the last processed request is stored as _pending_response and will be emitted (single output per internal event).\n- Output function (lambdaf):\n  - When phase == RESPOND and _pending_response is set, emits exactly one message on dequeue_response_out.\n- Internal transition (deltint):\n  - After RESPOND, clears _pending_response and returns to IDLE with infinite time advance.\n\nPhases:\n- IDLE: passive waiting (sigma=inf), no output.\n- RESPOND: scheduled immediately (sigma=0) to emit one dequeue_response_out corresponding to the last processed dequeue request.\n\nInitialization/finalization:\n- initialize(): resets all station queues to empty and clears pending response; enters IDLE.\n- exit(): logs final queue lengths and current time.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'model': <str model name>, 'param': {'station_ids': [1,2,3,4,5]}}\", \"description\": \"Emitted in __init__ after ports/state setup to record model creation and hardcoded parameters.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Initialized', 'station_queue_lengths': {'1': <int>, '2': <int>, '3': <int>, '4': <int>, '5': <int>}}\", \"description\": \"Emitted in initialize() after resetting queues; records initial per-station queue lengths (all zeros). Keys are stringified station ids.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Passenger Enqueued', 'station_id': <int>, 'passenger': {'passenger_id': <int>, 'passenger_num': <int>, 'origin': <int>, 'destination': <int>}, 'new_length': <int>}\", \"description\": \"Emitted in deltext for each valid passenger_in message after enqueueing into queue_by_station[origin].\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Passenger Rejected', 'reason': <str reason_code>, 'passenger': <dict received passenger record>}\", \"description\": \"Emitted in deltext for each invalid passenger_in message; reason codes include missing_key_*, bad_type_*, origin_out_of_range, destination_out_of_range, destination_equals_origin.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Dequeue Request Processed', 'station_id': <int>, 'has_passenger': <bool>, 'passenger': <dict|{}>, 'new_length': <int>}\", \"description\": \"Emitted in deltext for each dequeue_request_in processed (including invalid requests). For invalid requests, new_length is -1 and station_id may be -1. For valid empty queues, new_length is 0.\"}, {\"log_type\": \"RESULT\", \"msg\": \"{'event': 'Model Finalized', 'station_queue_lengths': {'1': <int>, '2': <int>, '3': <int>, '4': <int>, '5': <int>}, 'time': <any current time from get_current_time()>}\", \"description\": \"Emitted in exit(); records final per-station queue lengths and current simulation time. Keys for station_queue_lengths are stringified station ids.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name passed to Atomic superclass; used in logs as `model` and as DEVS model identifier."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to parent coupled model if any; stored as self.parent. If None, model is intended to be a root model. Not otherwise used in logic."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "passenger_in",
+          "type": "dict",
+          "structure": "Passenger record to enqueue.\nRequired keys and types:\n- passenger_id: int (unique ID)\n- passenger_num: int (sequential counter)\n- origin: int (must be one of station_ids [1,2,3,4,5])\n- destination: int (must be one of station_ids [1,2,3,4,5] and must be != origin)\nExtra keys are ignored; the model stores only the four required fields.",
+          "protocol": {
+            "initial_state": "At T=0 (after initialize), all station queues are empty; model is in phase IDLE with sigma=inf.",
+            "initial_signal": "No initial messages are emitted.",
+            "description": "On each external transition, iterates over all received passenger_in messages; validates schema and constraints; if valid, enqueues passenger into FIFO queue for queue_by_station[origin]. If invalid, rejects and only logs the rejection."
+          }
+        },
+        {
+          "name": "dequeue_request_in",
+          "type": "dict",
+          "structure": "Dequeue request.\nExpected keys:\n- station_id: int (requested station; should be in [1..5])\nIf missing or invalid type/range, treated as invalid request and responded with empty passenger.",
+          "protocol": {
+            "initial_state": "At T=0 (after initialize), ready to accept dequeue requests in IDLE with sigma=inf; no pending response.",
+            "initial_signal": "No initial messages are emitted.",
+            "description": "For each request, immediately prepares a response describing whether a passenger was dequeued. If multiple requests arrive simultaneously, only the last processed request is retained as _pending_response and will be emitted on the next immediate internal event (RESPOND, sigma=0)."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "dequeue_response_out",
+          "type": "dict",
+          "structure": "Response to a dequeue request.\nKeys:\n- station_id: int (requested station_id; for invalid requests may be -1 or the provided int)\n- has_passenger: bool\n- passenger: dict\n  - If has_passenger == True: passenger dict with keys {passenger_id:int, passenger_num:int, origin:int, destination:int}\n  - If has_passenger == False: {}",
+          "protocol": {
+            "initial_state": "At T=0 (after initialize), there is no pending response; no outputs are scheduled.",
+            "initial_signal": "No initial messages are emitted.",
+            "description": "Emits at most one response per internal event when the model is in phase RESPOND (sigma=0). A response is scheduled immediately after processing dequeue_request_in in deltext by setting _pending_response and holding in RESPOND with 0 delay."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "TrainLoadStore",
+    "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/TrainLoadStore.py",
+    "logic_path": "OTrain.StationServiceSystem.TrainLoadStore",
+    "specification": {
+      "function": "Atomic DEVS model that owns and maintains an in-train passenger storage grouped by destination station as FIFO lists: train_load[destination_station_id] for station IDs 1..5.\n\nCore workflow / DEVS behavior:\n- Initialization (initialize):\n  - Resets train_load for station_ids [1..5] to empty lists.\n  - Clears any pending output (_pending_out_port/_pending_out_payload).\n  - Enters phase IDLE with sigma = +inf.\n\n- External transition (deltext): instantaneous command handling (elapsed time e is ignored):\n  1) append_boarded_in:\n     - For each incoming message, expects {\"passenger\": passenger_dict}.\n     - Validates passenger_dict has keys passenger_id, passenger_num, origin, destination; all ints; origin != destination; origin and destination within station_ids.\n     - If valid, appends passenger_dict to train_load[destination] FIFO; no DEVS output is produced.\n     - If invalid, logs ERROR (still no output).\n\n  2) alight_start_in:\n     - Considers the last message received at the current simulation time (\"last one wins\"), because the model can emit at most one output per internal event.\n     - Expects {\"station_id\": int(1..5), \"arrival_time\": float}.\n     - If valid, snapshots count = len(train_load[station_id]) and prepares pending output on alight_count_out = {\"station_id\": station_id, \"count\": count}.\n     - Schedules immediate internal event: hold_in(\"RESPOND_ALIGHT_COUNT\", 0.0).\n     - If invalid, logs ERROR and does not schedule output.\n\n  3) pop_exiting_in:\n     - Only processed if no alight_start_in output was scheduled (the method returns immediately after scheduling an alight response).\n     - Considers the last message received at the current simulation time (\"last one wins\").\n     - Expects {\"station_id\": int(1..5)}.\n     - If valid, pops FIFO head from train_load[station_id] if any and prepares pending output on exiting_passenger_out:\n       - If passenger exists: {\"station_id\": station_id, \"has_passenger\": True, \"passenger\": passenger_dict}\n       - Else: {\"station_id\": station_id, \"has_passenger\": False, \"passenger\": {}}\n     - Schedules immediate internal event: hold_in(\"RESPOND_POP_EXITING\", 0.0).\n     - If invalid, logs ERROR and does not schedule output.\n\n  4) If no output is prepared, remains/returns to IDLE with sigma = +inf.\n\n- Output function (lambdaf):\n  - Emits exactly one message based on phase and pending port/payload:\n    - If phase == RESPOND_ALIGHT_COUNT and _pending_out_port == \"alight_count_out\": outputs _pending_out_payload on alight_count_out.\n    - If phase == RESPOND_POP_EXITING and _pending_out_port == \"exiting_passenger_out\": outputs _pending_out_payload on exiting_passenger_out.\n\n- Internal transition (deltint):\n  - After emitting the response in a RESPOND_* phase, clears pending output and returns to IDLE.\n\n- Finalization (exit):\n  - Logs final sizes per station.\n\nNotes on prioritization/one-output-per-cycle:\n- If both alight_start_in and pop_exiting_in arrive at the same simulation time, alight_start_in is handled first and causes an immediate return after scheduling its response; pop_exiting_in will be deferred until a later time/event.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'model': <str model name>, 'param': {'station_ids': <list[int]>}}\", \"description\": \"Emitted during __init__ after ports/state/params are set. Indicates creation and internal hardcoded parameters (station_ids=[1..5]).\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Initialized', 'train_load_size': {<sid_str>: <int count>, ...}} where sid_str are '1'..'5'\", \"description\": \"Emitted in initialize() after resetting train_load. Reports current FIFO sizes per station (stringified station IDs).\"}, {\"log_type\": \"PROCESS or ERROR\", \"msg\": \"{'event': 'Boarded Appended', 'passenger': <dict passenger or {}>, 'new_count': <int>}\", \"description\": \"Emitted in deltext() for each append_boarded_in message. PROCESS when passenger validated and appended (new_count is updated length for destination). ERROR when input schema/validation fails (new_count = -1).\"}, {\"log_type\": \"PROCESS or ERROR\", \"msg\": \"{'event': 'Alight Start Processed', 'cmd': <dict>, 'count': <int>}\", \"description\": \"Emitted in deltext() when handling an alight_start_in command. PROCESS when valid (count is snapshot len for station_id). ERROR when invalid (count = -1).\"}, {\"log_type\": \"PROCESS or ERROR\", \"msg\": \"{'event': 'Pop Exiting Processed', 'cmd': <dict>, 'result': {'station_id': <int>, 'has_passenger': <bool>, 'passenger': <dict or {}>}}\", \"description\": \"Emitted in deltext() when handling a pop_exiting_in command. PROCESS when valid and result is computed. ERROR when invalid station_id (station_id set to -1 in logged result).\"}, {\"log_type\": \"RESULT\", \"msg\": \"{'event': 'Model Finalized', 'train_load_size': {<sid_str>: <int count>, ...}} where sid_str are '1'..'5'\", \"description\": \"Emitted in exit() at model finalization; reports final FIFO sizes per station (stringified station IDs).\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model instance name passed to Atomic superclass; used in logs as model identifier."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. If None, this atomic model is a root model. Stored as self.parent; not otherwise used in logic."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "alight_start_in",
+          "type": "dict",
+          "structure": "Alighting start command.\nExpected dict fields:\n- station_id: int, must be one of {1,2,3,4,5}\n- arrival_time: float (simulation time in seconds)\nNotes:\n- If multiple messages arrive at the same simulation time, only the last one is used to generate a response (single output per cycle).",
+          "protocol": {
+            "initial_state": "At T=0: train_load for station_ids 1..5 initialized to empty FIFO lists; model phase IDLE; no pending responses.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "On reception: validate station_id and arrival_time. If valid, snapshot current len(train_load[station_id]) and schedule immediate internal event to output one response on alight_count_out, then return to IDLE. If invalid, log ERROR and remain IDLE without output."
+          }
+        },
+        {
+          "name": "pop_exiting_in",
+          "type": "dict",
+          "structure": "Command to pop next exiting passenger for a station.\nExpected dict fields:\n- station_id: int, must be one of {1,2,3,4,5}\nNotes:\n- If multiple messages arrive at the same simulation time, only the last one is used to generate a response.\n- If an alight_start_in command in the same deltext schedules an output, pop_exiting_in is not processed in that call (alight has priority).",
+          "protocol": {
+            "initial_state": "At T=0: no pending pop operations; train_load empty; model phase IDLE.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "On reception: validate station_id. If valid, pop FIFO head from train_load[station_id] if present; otherwise return has_passenger=False and passenger={}. Schedule immediate internal event to output one response on exiting_passenger_out, then return to IDLE. If invalid, log ERROR and remain IDLE without output."
+          }
+        },
+        {
+          "name": "append_boarded_in",
+          "type": "dict",
+          "structure": "Command to append a boarded passenger into storage by destination.\nExpected dict fields:\n- passenger: dict with fields:\n  - passenger_id: int\n  - passenger_num: int\n  - origin: int in {1,2,3,4,5}\n  - destination: int in {1,2,3,4,5} and destination != origin",
+          "protocol": {
+            "initial_state": "At T=0: ready to accept boarded passengers; train_load empty; no pending outputs.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "For each received message: validate presence and schema of passenger. If valid, append to FIFO list train_load[passenger['destination']]. Produces no output. If invalid, logs ERROR."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "alight_count_out",
+          "type": "dict",
+          "structure": "Alighting count response.\nFields:\n- station_id: int in {1,2,3,4,5}\n- count: int >= 0, number of passengers currently stored for that destination",
+          "protocol": {
+            "initial_state": "At T=0: no pending responses.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Emitted exactly once for each valid alight_start_in processed (subject to 'last one wins' if multiple in same time). Output occurs at an immediate internal event (sigma=0) in phase RESPOND_ALIGHT_COUNT, then model returns to IDLE."
+          }
+        },
+        {
+          "name": "exiting_passenger_out",
+          "type": "dict",
+          "structure": "Next exiting passenger popped from FIFO for a station.\nFields:\n- station_id: int in {1,2,3,4,5}\n- has_passenger: bool\n- passenger: dict if has_passenger else {}\n  - passenger_id: int\n  - passenger_num: int\n  - origin: int in {1,2,3,4,5}\n  - destination: int in {1,2,3,4,5}",
+          "protocol": {
+            "initial_state": "At T=0: no pending exiting passenger messages.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Emitted exactly once for each valid pop_exiting_in processed (subject to 'last one wins' if multiple in same time, and only if an alight response was not scheduled in the same deltext). Output occurs at an immediate internal event (sigma=0) in phase RESPOND_POP_EXITING, then model returns to IDLE."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "ArrivalPhaseCoordinator",
+    "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/ServiceOrchestrator_libs/ArrivalPhaseCoordinator.py",
+    "logic_path": "OTrain.StationServiceSystem.ServiceOrchestrator.ArrivalPhaseCoordinator",
+    "specification": {
+      "function": "Atomic DEVS coordinator for per-train-arrival phase ordering.\n\nResponsibilities / workflow:\n- Maintains an IDLE state until it receives external events.\n- On each message from `train_arrival_in`, it:\n  - Reads `station_id` and `direction`.\n  - Captures the current simulation time via `get_current_time()` as `arrival_time`.\n  - Prepares (buffers) three outputs for immediate emission in the next internal event:\n    - `alight_start_out` (start command)\n    - `alight_start_ctx_out` (context broadcast)\n    - `board_start_ctx_out` (context broadcast)\n  - Schedules an immediate internal transition with phase `EMIT_STARTS` (hold_in with sigma=0.0).\n- On each message from `alight_complete_in`, it:\n  - Reads `station_id` and `arrival_time`.\n  - Prepares (buffers) one output for immediate emission:\n    - `alight_done_out` (gate release to allow boarding for that same arrival)\n  - Schedules an immediate internal transition with phase `EMIT_ALIGHT_DONE` if nothing else is scheduled.\n  - If a train arrival is also present at the same simulation time, it prioritizes emitting `EMIT_STARTS` first and attempts to chain the gate release immediately after. (Note: code stores chained gate payloads in `self._chain_after_starts`, but there is no subsequent logic in `deltint/lambdaf` to emit from this chain; only the last buffered `alight_done_out` is emitted when phase is `EMIT_ALIGHT_DONE`.)\n\nState machine / phases:\n- IDLE: passive, no outputs, waits indefinitely.\n- EMIT_STARTS: outputs buffered start/context messages in `lambdaf`, then `deltint` logs and clears buffers and returns to IDLE.\n- EMIT_ALIGHT_DONE: outputs buffered gate release message in `lambdaf`, then `deltint` logs and clears buffers and returns to IDLE.\n\nCommunication protocol notes:\n- Initialization: no initial signals; model starts in IDLE with infinite time advance.\n- Receive: via `deltext` reading all messages currently in each input port.\n- Send: via `lambdaf` emitting buffered messages depending on phase.\n- End: `exit()` logs final KPI counters.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'service_time_seconds': <float>, 'param': {'epsilon': <float>}}\", \"description\": \"Emitted in `__init__` after ports/config/state are created. `param.epsilon` is a small non-negative scheduling epsilon (hardcoded 0.0; not used to shift timestamps by default).\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Initialized', 'service_time_seconds': <float>}\", \"description\": \"Emitted in `initialize()` after clearing pending outputs and before entering IDLE.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Train Arrival Received', 'station_id': <int>, 'direction': <int>}\", \"description\": \"Emitted in `deltext()` once per message read from `train_arrival_in`.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Alight Completion Received', 'station_id': <int>, 'arrival_time': <float>}\", \"description\": \"Emitted in `deltext()` once per message read from `alight_complete_in`.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Outputs Emitted', 'phase': <str>, 'outputs': {'alight_start_out': <dict|None>, 'alight_start_ctx_out': <dict|None>, 'board_start_ctx_out': <dict|None>, 'alight_done_out': <dict|None>}}\", \"description\": \"Emitted in `deltint()` immediately after `lambdaf()` for phases `EMIT_STARTS` and `EMIT_ALIGHT_DONE`. `phase` is one of 'EMIT_STARTS' or 'EMIT_ALIGHT_DONE'. `outputs` mirrors the internal pending output buffers at emission time.\"}, {\"log_type\": \"RESULT\", \"msg\": \"{'event': 'Model Finalized', 'arrivals_received': <int>, 'alight_completions_received': <int>, 'gates_released': <int>}\", \"description\": \"Emitted in `exit()` at the end of simulation to report KPI counters.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique name of the model instance (passed to Atomic super class)."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to parent coupled model; may be None when used as a root model. Stored as `self.parent` but not otherwise used internally."
+        },
+        {
+          "name": "service_time_seconds",
+          "type": "float",
+          "structure": "Per-passenger boarding/alighting time in seconds. Default 0.025. Stored as `self.service_time_seconds` and logged; not used in transition/output logic in this class."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "train_arrival_in",
+          "type": "dict",
+          "structure": "Train arrival notification.\nKeys:\n- station_id (int): Station ID in [1..5].\n- direction (int): 0 (Southbound) or 1 (Northbound).",
+          "protocol": {
+            "initial_state": "Ready at T=0; no pending outputs/schedules; model held in IDLE with infinite time advance.",
+            "initial_signal": "No initial signal.",
+            "description": "For each arrival message received in `deltext`, the model immediately schedules an internal event (sigma=0.0) to emit: (1) alighting start command and (2) arrival context broadcasts for both AlightingScheduler and BoardingScheduler. Boarding is gated by a later `alight_done_out`."
+          }
+        },
+        {
+          "name": "alight_complete_in",
+          "type": "dict",
+          "structure": "Alighting completion notification.\nKeys:\n- station_id (int): Station ID in [1..5].\n- arrival_time (float): The train arrival simulation time (seconds) for which alighting is complete.",
+          "protocol": {
+            "initial_state": "No completion pending; model in IDLE.",
+            "initial_signal": "No initial signal.",
+            "description": "Upon receipt in `deltext`, the model immediately schedules an internal event (sigma=0.0) to emit `alight_done_out` for the same (station_id, arrival_time) to release the boarding gate."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "alight_start_out",
+          "type": "dict",
+          "structure": "Alighting start command.\nKeys:\n- station_id (int): Station ID in [1..5].\n- arrival_time (float): The train arrival simulation time (seconds), set to `get_current_time()` when processing `train_arrival_in`.",
+          "protocol": {
+            "initial_state": "No output pending.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted immediately (next internal event at sigma=0.0) upon each `train_arrival_in` when phase is `EMIT_STARTS`."
+          }
+        },
+        {
+          "name": "alight_start_ctx_out",
+          "type": "dict",
+          "structure": "Arrival context broadcast to AlightingScheduler.\nKeys:\n- station_id (int): Station ID in [1..5].\n- arrival_time (float): The train arrival simulation time (seconds), set to `get_current_time()`.\n- direction (int): 0 or 1.",
+          "protocol": {
+            "initial_state": "No output pending.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted immediately (next internal event at sigma=0.0) upon each `train_arrival_in` when phase is `EMIT_STARTS`."
+          }
+        },
+        {
+          "name": "board_start_ctx_out",
+          "type": "dict",
+          "structure": "Arrival context broadcast to BoardingScheduler.\nKeys:\n- station_id (int): Station ID in [1..5].\n- arrival_time (float): The train arrival simulation time (seconds), set to `get_current_time()`.\n- direction (int): 0 or 1.",
+          "protocol": {
+            "initial_state": "No output pending.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted immediately (next internal event at sigma=0.0) upon each `train_arrival_in` when phase is `EMIT_STARTS`. Boarding is expected to wait for `alight_done_out` for the same arrival."
+          }
+        },
+        {
+          "name": "alight_done_out",
+          "type": "dict",
+          "structure": "Gate release signal to BoardingScheduler.\nKeys:\n- station_id (int): Station ID in [1..5].\n- arrival_time (float): The train arrival simulation time (seconds), copied from `alight_complete_in.arrival_time`.",
+          "protocol": {
+            "initial_state": "No output pending.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted immediately (next internal event at sigma=0.0) only after receiving `alight_complete_in` for the same arrival, when phase is `EMIT_ALIGHT_DONE`."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "AlightingScheduler",
+    "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/ServiceOrchestrator_libs/AlightingScheduler.py",
+    "logic_path": "OTrain.StationServiceSystem.ServiceOrchestrator.AlightingScheduler",
+    "specification": {
+      "function": "Atomic DEVS model that schedules and coordinates passenger alighting for one active train-arrival context at a time.\n\nHigh-level workflow / protocol:\n- Initialization: enters phase IDLE with sigma=inf; no pending payloads.\n- Start of an alighting cycle (external input on arrival_ctx_in):\n  - If no active arrival, stores active_arrival_ctx = {station_id, arrival_time, direction} and transitions to WAIT_COUNT.\n  - If an arrival arrives while another is active, it is ignored and an ERROR log is emitted.\n- Count acquisition (external input on alight_count_in while active):\n  - Validates station_id matches active context.\n  - Sets expected_count = max(0,count), next_slot_index=1.\n  - If expected_count==0: immediately schedules COMPLETE (sigma=0) and will emit alight_complete_out.\n  - Else: schedules the first POP at time arrival_time + service_time_seconds*1.\n- Slot execution loop (for j = next_slot_index .. expected_count):\n  - Internal event POP: at the scheduled slot time, lambdaf emits pop_exiting_out {station_id}; deltint moves to WAIT_PASSENGER and sets waiting_for_passenger=True.\n  - External response on exiting_passenger_in (only accepted while WAIT_PASSENGER and waiting_for_passenger=True, and matching station_id):\n    - If has_passenger=True: prepares exiting_event_out payload with scheduled slot time and passenger fields and immediately emits it via EMIT_EXIT_EVENT (sigma=0).\n    - If has_passenger=False: treats the slot as processed and schedules next slot or completion.\n  - Internal event EMIT_EXIT_EVENT: lambdaf emits exiting_event_out; deltint increments forwarded KPI and schedules next slot or completion.\n- Completion:\n  - When all slots are processed, schedules COMPLETE (sigma=0) and lambdaf emits alight_complete_out {station_id, arrival_time}; deltint resets internal state and returns to IDLE.\n\nTiming details:\n- Slot j scheduled time = arrival_time + service_time_seconds * j.\n- POP delay computed against get_current_time(); delay is clamped to >=0 and snapped to 0 if below param['eps_time'].\n\nState machine phases:\n- IDLE: no active arrival.\n- WAIT_COUNT: waiting for alight_count_in for the active arrival.\n- POP: outputs pop_exiting_out at state end (lambdaf).\n- WAIT_PASSENGER: waiting for exiting_passenger_in after POP.\n- EMIT_EXIT_EVENT: outputs exiting_event_out at state end (only when has_passenger=True).\n- COMPLETE: outputs alight_complete_out at state end then returns to IDLE.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{\\\"event\\\":\\\"Model Created\\\",\\\"service_time_seconds\\\":<float>,\\\"param\\\":{\\\"eps_time\\\":<float>}}\", \"description\": \"Emitted in __init__ after ports/config are set. Captures configuration and hardcoded parameters.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{\\\"event\\\":\\\"Model Initialized\\\",\\\"service_time_seconds\\\":<float>}\", \"description\": \"Emitted in initialize() after resetting internal state and before holding in IDLE.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{\\\"event\\\":\\\"Arrival Context Received\\\", \\\"station_id\\\":<int>, \\\"arrival_time\\\":<float>, \\\"direction\\\":<int>, ...}\", \"description\": \"Emitted in deltext() for each message read from arrival_ctx_in. The logged dict is {event:..., **ctx} so it contains the arrival context fields.\"}, {\"log_type\": \"ERROR\", \"msg\": \"{\\\"event\\\":\\\"Arrival Context Ignored\\\",\\\"reason\\\":\\\"active_arrival_in_progress\\\",\\\"incoming\\\":<dict arrival_ctx_in>,\\\"active\\\":<dict active_arrival_ctx>}\", \"description\": \"Emitted in deltext() when a new arrival context arrives while an active context is still being processed.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{\\\"event\\\":\\\"Alight Count Received\\\", \\\"station_id\\\":<int>, \\\"count\\\":<int>, ...}\", \"description\": \"Emitted in deltext() for each message read from alight_count_in. The logged dict is {event:..., **cnt_msg}.\"}, {\"log_type\": \"ERROR\", \"msg\": \"{\\\"event\\\":\\\"Alight Count Ignored\\\",\\\"reason\\\":(\\\"no_active_arrival\\\"|\\\"station_mismatch\\\"),\\\"incoming\\\":<dict alight_count_in>,\\\"active_station_id\\\":<int optional>}\", \"description\": \"Emitted in deltext() if an alight count arrives without an active context or with mismatched station_id.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{\\\"event\\\":\\\"Pop Exiting Command Scheduled\\\",\\\"station_id\\\":<int>,\\\"arrival_time\\\":<float>,\\\"direction\\\":<int>,\\\"slot_index\\\":<int>,\\\"scheduled_time\\\":<float>}\", \"description\": \"Emitted in _schedule_pop_for_current_slot() when a POP internal event is scheduled for a slot.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{\\\"event\\\":\\\"Exiting Passenger Received\\\", \\\"station_id\\\":<int>, \\\"has_passenger\\\":<bool>, \\\"passenger\\\":<dict>, ...}\", \"description\": \"Emitted in deltext() for each message read from exiting_passenger_in. The logged dict is {event:..., **resp}.\"}, {\"log_type\": \"ERROR\", \"msg\": \"{\\\"event\\\":\\\"Exiting Passenger Ignored\\\",\\\"reason\\\":(\\\"no_active_arrival\\\"|\\\"not_waiting_for_passenger\\\"|\\\"station_mismatch\\\"),\\\"incoming\\\":<dict exiting_passenger_in>,\\\"phase\\\":<str optional>,\\\"active_station_id\\\":<int optional>}\", \"description\": \"Emitted in deltext() when an exiting passenger response is unexpected (no active context, not in WAIT_PASSENGER, or station mismatch).\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{\\\"event\\\":\\\"Exiting Event Forwarded\\\",\\\"time\\\":<float>,\\\"station_id\\\":<int>,\\\"direction\\\":<int>,\\\"passenger\\\":{...}}\", \"description\": \"Emitted in deltext() when has_passenger==True and an exiting_event_out payload is prepared (then emitted with sigma=0).\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{\\\"event\\\":\\\"Alight Complete Emitted\\\",\\\"station_id\\\":<int>,\\\"arrival_time\\\":<float>}\", \"description\": \"Emitted when completion payload is prepared (either after count==0 or after processing final slot), then emitted in phase COMPLETE with sigma=0.\"}, {\"log_type\": \"RESULT\", \"msg\": \"{\\\"event\\\":\\\"Model Finalized\\\",\\\"total_arrivals_processed\\\":<int>,\\\"total_pop_commands_sent\\\":<int>,\\\"total_exiting_events_forwarded\\\":<int>}\", \"description\": \"Emitted in exit() at end of simulation run, reporting KPI counters.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model instance name passed to Atomic.__init__. Used by simulator/logging identification."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to parent coupled model (may be None for root). Stored as self.parent; not otherwise used for behavior in this class."
+        },
+        {
+          "name": "service_time_seconds",
+          "type": "float",
+          "structure": "Per-passenger alighting service time in seconds. Converted to float and used to compute slot schedule times: arrival_time + service_time_seconds * slot_index. Default=0.025."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "arrival_ctx_in",
+          "type": "dict",
+          "structure": "Arrival context dict:\n- station_id (int): Station ID, expected 1..5\n- arrival_time (float): simulation time when train arrived\n- direction (int): 0=Southbound, 1=Northbound",
+          "protocol": {
+            "initial_state": "At T=0: no active arrival context; model is in IDLE with no schedules.",
+            "initial_signal": "No initial signal.",
+            "description": "On receipt: if no active arrival, stores as active_arrival_ctx and transitions to WAIT_COUNT awaiting alight_count_in. If an active arrival is already in progress, incoming contexts are ignored (logged as ERROR)."
+          }
+        },
+        {
+          "name": "alight_count_in",
+          "type": "dict",
+          "structure": "Alighting count message:\n- station_id (int): Station ID, expected 1..5\n- count (int): number of passengers to alight, expected >=0 (clamped via max(0,count))",
+          "protocol": {
+            "initial_state": "At T=0: no pending count; only meaningful after an arrival_ctx_in has activated a context.",
+            "initial_signal": "No initial signal.",
+            "description": "On receipt: only accepted when an active arrival exists and station_id matches active context. Sets expected_count and schedules POP slots. If count==0, immediately schedules COMPLETE (sigma=0) and emits alight_complete_out."
+          }
+        },
+        {
+          "name": "exiting_passenger_in",
+          "type": "dict",
+          "structure": "Response to a prior pop_exiting_out:\n- station_id (int): Station ID, expected 1..5\n- has_passenger (bool): True if a passenger was popped\n- passenger (dict): present/used only when has_passenger=True; otherwise may be {}.\n  - passenger_id (int)\n  - passenger_num (int)\n  - origin (int): 1..5\n  - destination (int): 1..5",
+          "protocol": {
+            "initial_state": "At T=0: no pending passenger response; only expected after POP has been emitted.",
+            "initial_signal": "No initial signal.",
+            "description": "Only accepted while phase==WAIT_PASSENGER and waiting_for_passenger==True and station matches active context. If has_passenger=True, prepares and immediately emits exiting_event_out at current sim time (sigma=0 via EMIT_EXIT_EVENT). If has_passenger=False, advances scheduling without emitting exiting_event_out."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "pop_exiting_out",
+          "type": "dict",
+          "structure": "Command dict to request TrainLoadStore to pop an exiting passenger:\n- station_id (int): Station ID (1..5)",
+          "protocol": {
+            "initial_state": "At T=0: no pending pop commands.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted during phase POP at the scheduled slot time for each slot j=1..expected_count. Exactly one pop command per scheduled slot."
+          }
+        },
+        {
+          "name": "exiting_event_out",
+          "type": "dict",
+          "structure": "Exiting passenger event forwarded for logging:\n- time (float): scheduled exit time = arrival_time + service_time_seconds * slot_index\n- station_id (int): 1..5\n- direction (int): 0 or 1\n- passenger (dict):\n  - passenger_id (int)\n  - passenger_num (int)\n  - origin (int): 1..5\n  - destination (int): 1..5",
+          "protocol": {
+            "initial_state": "At T=0: no pending exiting events.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted only when exiting_passenger_in has has_passenger==True. Emitted immediately (sigma=0) in phase EMIT_EXIT_EVENT after receiving the response for a slot."
+          }
+        },
+        {
+          "name": "alight_complete_out",
+          "type": "dict",
+          "structure": "Completion notification dict:\n- station_id (int): station of completed arrival\n- arrival_time (float): arrival time of completed context",
+          "protocol": {
+            "initial_state": "At T=0: no completion notifications.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted once per arrival context when all scheduled slots have been processed (including final response). Also emitted immediately when expected_count==0."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "BoardingScheduler",
+    "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/ServiceOrchestrator_libs/BoardingScheduler.py",
+    "logic_path": "OTrain.StationServiceSystem.ServiceOrchestrator.BoardingScheduler",
+    "specification": {
+      "function": "Atomic DEVS model that schedules and executes passenger boarding for each train arrival after an alighting-complete gate is received.\n\nCore workflow / protocol:\n- Inputs provide (a) arrival contexts and (b) an alighting-done gate for a specific (station_id, arrival_time) pair.\n- The model buffers arrival contexts in an internal FIFO-like list and tracks gate releases in a dict keyed by \"{station_id}@{arrival_time:.9f}\".\n- When an arrival context is both present and gated, it becomes the active arrival (selected as the earliest gated arrival by arrival_time; stable w.r.t insertion order).\n- Boarding attempts are scheduled deterministically at:\n  scheduled_time = arrival_time + service_time_seconds * m, for m = 1,2,3,...\n  using get_current_time() to compute sigma = scheduled_time - now, with epsilon handling (eps_time) and immediate execution if already passed.\n- State machine:\n  - IDLE: no pending internal actions; waits indefinitely. On external input, if a gated arrival is available, starts scheduling.\n  - SEND_DEQUEUE (internal event at scheduled_time): lambdaf sends dequeue_request_out {station_id}. Then deltint logs and transitions to WAIT_DEQUEUE_RESPONSE.\n  - WAIT_DEQUEUE_RESPONSE: waits indefinitely for dequeue_response_in. When response arrives for the currently pending station:\n      - if has_passenger=True: prepares outputs and immediately transitions to EMIT_BOARDING.\n      - if has_passenger=False: ends boarding for this arrival (clears active arrival) and immediately tries to start the next gated arrival, else returns to IDLE.\n  - EMIT_BOARDING (sigma=0): lambdaf sends boarded_passenger_out and boarding_event_out, then deltint logs, increments boarded KPI, and schedules the next dequeue attempt for the same active arrival.\n- Termination for an arrival: occurs when dequeue_response_in indicates has_passenger=False for the active station; then boarding attempts stop and the next gated arrival (if any) is selected.\n\nRelated sibling/other systems (per docstring):\n- Receives arrival_ctx_in from [Sibling-ArrivalPhaseCoordinator: board_start_ctx_out].\n- Receives alight_done_in from [Sibling-ArrivalPhaseCoordinator: alight_done_out].\n- Exchanges dequeue_request_out / dequeue_response_in with StationQueueSystem.\n- Sends boarded_passenger_out to TrainLoadStore.\n- Sends boarding_event_out to PassengerEventLogger.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'service_time_seconds': <float>, 'param': {'eps_time': <float>}}\", \"description\": \"Logged once in __init__ after configuration/parameters are set. Captures configured boarding service time and internal hardcoded parameters.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Initialized', 'service_time_seconds': <float>}\", \"description\": \"Logged in initialize() after resetting internal state and KPIs.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Arrival Context Received', 'station_id': <int>, 'arrival_time': <float>, 'direction': <int>}\", \"description\": \"Logged for each dict received on arrival_ctx_in during deltext(). Represents an arrival context being buffered.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Alight Done Gate Received', 'station_id': <int>, 'arrival_time': <float>}\", \"description\": \"Logged for each dict received on alight_done_in during deltext(). Represents the release of boarding gate for a specific arrival key.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Dequeue Response Processed', 'station_id': <int>, 'has_passenger': <bool>, 'passenger': <dict|{}>}\", \"description\": \"Logged for each response received on dequeue_response_in during deltext(), regardless of whether it is actionable in the current phase. Passenger may be {} if none (or if input passenger is None).\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Dequeue Requested', 'station_id': <int>}\", \"description\": \"Logged in deltint() immediately after the SEND_DEQUEUE output has been emitted and the internal transition occurs. Indicates the dequeue request for a station was issued.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Boarding Emitted', 'station_id': <int>, 'arrival_time': <float>, 'direction': <int>, 'scheduled_time': <float>, 'passenger': <dict>}\", \"description\": \"Logged in deltint() after EMIT_BOARDING outputs are emitted. Includes the active arrival's arrival_time (or -1.0 if missing), the scheduled boarding time, and passenger payload.\"}, {\"log_type\": \"RESULT\", \"msg\": \"{'event': 'Model Finalized', 'total_boarded': <int>, 'total_arrivals_seen': <int>}\", \"description\": \"Logged in exit() at end of simulation. Summarizes KPIs: number of boarded passengers forwarded and number of arrival contexts received.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name passed to Atomic.__init__(name). Used for identification/logging."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. Stored in self.parent. If None, model acts as a root model. Not otherwise used in logic."
+        },
+        {
+          "name": "service_time_seconds",
+          "type": "float",
+          "structure": "Per-passenger boarding service time in seconds. Default 0.025. Cast to float and used to compute scheduled boarding attempt times: arrival_time + service_time_seconds * m (m starts at 1)."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "arrival_ctx_in",
+          "type": "dict",
+          "structure": "Arrival context dict with keys:\n- station_id (int): Station ID in 1..5\n- arrival_time (float): Arrival timestamp in seconds\n- direction (int): 0 (southbound) or 1 (northbound)\nEach message is appended to an internal pending list; later selected for boarding only after its matching alight_done gate is received.",
+          "protocol": {
+            "initial_state": "At T=0, no active boarding schedules; pending list empty.",
+            "initial_signal": "No initial signal.",
+            "description": "On receipt, the context is buffered and counted (total_arrivals_seen++). Boarding for this context will not start until a matching alight_done_in arrives and the context becomes the earliest gated arrival."
+          }
+        },
+        {
+          "name": "alight_done_in",
+          "type": "dict",
+          "structure": "Gate dict indicating alighting is complete for a specific arrival, with keys:\n- station_id (int): 1..5\n- arrival_time (float): Arrival timestamp in seconds\nUsed to release (gate) boarding for the matching arrival key station_id@arrival_time.",
+          "protocol": {
+            "initial_state": "At T=0, no gates released; gated map empty.",
+            "initial_signal": "No initial signal.",
+            "description": "On receipt, marks the corresponding arrival key as gated (True). If the model is IDLE (or finishes an arrival), it may immediately select the next gated arrival and schedule the first dequeue request."
+          }
+        },
+        {
+          "name": "dequeue_response_in",
+          "type": "dict",
+          "structure": "Response dict from StationQueueSystem for a dequeue request, with keys:\n- station_id (int): 1..5\n- has_passenger (bool): whether a passenger was dequeued\n- passenger (dict): passenger data if has_passenger else {} (or None treated as {})\n  - passenger_id (int)\n  - passenger_num (int)\n  - origin (int): 1..5\n  - destination (int): 1..5",
+          "protocol": {
+            "initial_state": "At T=0, no pending responses expected.",
+            "initial_signal": "No initial signal.",
+            "description": "Meaningful primarily in WAIT_DEQUEUE_RESPONSE. Responses received in other phases are ignored. While waiting, only the response matching the currently pending station_id is processed. If has_passenger=True, transitions to EMIT_BOARDING immediately; otherwise ends boarding for that arrival and attempts to start next gated arrival."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "dequeue_request_out",
+          "type": "dict",
+          "structure": "Dequeue request dict sent to StationQueueSystem:\n- station_id (int): 1..5\nProduced at each scheduled boarding attempt time for the active arrival after it is gated.",
+          "protocol": {
+            "initial_state": "At T=0, no outstanding requests.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted in lambdaf when phase=SEND_DEQUEUE. One request per attempt. After sending, model transitions to WAIT_DEQUEUE_RESPONSE."
+          }
+        },
+        {
+          "name": "boarded_passenger_out",
+          "type": "dict",
+          "structure": "Boarded passenger forwarding dict to TrainLoadStore:\n- passenger (dict):\n  - passenger_id (int)\n  - passenger_num (int)\n  - origin (int): 1..5\n  - destination (int): 1..5 (should differ from origin per spec)\nEmitted only when a dequeue response indicates a passenger was obtained.",
+          "protocol": {
+            "initial_state": "At T=0, no boarded passengers to forward.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted in lambdaf when phase=EMIT_BOARDING and a valid passenger was dequeued. Cleared after internal transition; increments total boarded KPI."
+          }
+        },
+        {
+          "name": "boarding_event_out",
+          "type": "dict",
+          "structure": "Boarding event dict for PassengerEventLogger:\n- time (float): boarding event time; intended to equal the scheduled boarding time (stored as _scheduled_time)\n- station_id (int): 1..5\n- direction (int): 0 or 1\n- passenger (dict):\n  - passenger_id (int)\n  - passenger_num (int)\n  - origin (int): 1..5\n  - destination (int): 1..5\nEmitted only when has_passenger=True.",
+          "protocol": {
+            "initial_state": "At T=0, no pending boarding log events.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted in lambdaf when phase=EMIT_BOARDING. The event time is set to _scheduled_time if available, else current simulation time. Logged as \"Boarding Emitted\" during deltint."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "PassengerEventLogger",
+    "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/ServiceOrchestrator_libs/PassengerEventLogger.py",
+    "logic_path": "OTrain.StationServiceSystem.ServiceOrchestrator.PassengerEventLogger",
+    "specification": {
+      "function": "Atomic DEVS logger model that passively waits in phase IDLE (sigma = +inf) and never schedules internal events or produces port outputs.\n\nWorkflow / logic:\n- Construction (__init__):\n  - Creates two input ports: exiting_event_in and boarding_event_in.\n  - Defines a hardcoded station_id -> station name mapping in self.param[\"station_name_by_id\"] for ids 1..5.\n  - Holds in IDLE indefinitely.\n  - Logs a \"Model Created\" PROCESS event containing model name and param.\n\n- initialize():\n  - Holds in IDLE indefinitely (ready at T=0).\n  - Logs a \"Model Initialized\" PROCESS event.\n\n- deltext(e):\n  - Ignores elapsed time e for scheduling.\n  - For each message in input[\"exiting_event_in\"].values:\n    - Validates schema/types via _is_valid_internal_event (requires time: float, station_id: int in {1..5}, direction: int in {0,1}, passenger dict with passenger_id/passenger_num/origin/destination all ints).\n    - If invalid: logs ERROR \"Invalid Input Dropped\" with reason \"invalid_exiting_event_schema\" and raw payload.\n    - If valid: emits a JSONL-compatible RESULT event dict with event=\"passenger_exiting\", entity_type=\"train_queue\", station_id, station name, and payload passenger fields (direction ignored).\n  - For each message in input[\"boarding_event_in\"].values:\n    - Same validation.\n    - If invalid: logs ERROR \"Invalid Input Dropped\" with reason \"invalid_boarding_event_schema\".\n    - If valid: emits a JSONL-compatible RESULT event dict with event=\"passenger_boarding\", entity_type=\"station_queue\" (direction ignored).\n  - Returns to IDLE indefinitely.\n\n- lambdaf(): no outputs (no output ports).\n\n- deltint(): no internal transitions other than staying IDLE.\n\n- exit():\n  - Logs a final RESULT event \"Model Finalized\" including model name and current simulation time (from get_current_time()).\n\nCommunication protocol:\n- Initiation: ready at T=0 with no initial signals.\n- Receive: consumes any number of incoming dict messages on either input port during deltext.\n- Send: no port sends; one logger call per received valid event; invalid events produce an ERROR logger call.\n- Termination: on exit(), logs finalization record.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{ 'event': 'Model Created', 'model': <str>, 'param': { 'station_name_by_id': {1:'Bayview',2:'Carling',3:'Carleton',4:'Confed',5:'Greenboro'} } }\", \"description\": \"Emitted once during __init__ after ports/params are set.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{ 'event': 'Model Initialized', 'model': <str> }\", \"description\": \"Emitted once during initialize() when model is ready at T=0.\"}, {\"log_type\": \"RESULT\", \"msg\": \"{ 'time': <float>, 'event': 'passenger_boarding', 'entity_type': 'station_queue', 'station_id': <int 1..5>, 'station': <str>, 'payload': { 'passenger_id': <int>, 'passenger_num': <int>, 'origin': <int>, 'destination': <int> } }\", \"description\": \"Emitted in deltext() once per valid message received on boarding_event_in. direction is validated but omitted from output.\"}, {\"log_type\": \"RESULT\", \"msg\": \"{ 'time': <float>, 'event': 'passenger_exiting', 'entity_type': 'train_queue', 'station_id': <int 1..5>, 'station': <str>, 'payload': { 'passenger_id': <int>, 'passenger_num': <int>, 'origin': <int>, 'destination': <int> } }\", \"description\": \"Emitted in deltext() once per valid message received on exiting_event_in. direction is validated but omitted from output.\"}, {\"log_type\": \"ERROR\", \"msg\": \"{ 'event': 'Invalid Input Dropped', 'reason': <str: 'invalid_exiting_event_schema' | 'invalid_boarding_event_schema'>, 'port': <str: 'exiting_event_in' | 'boarding_event_in'>, 'raw': <dict> }\", \"description\": \"Emitted in deltext() when an incoming message fails validation; message is dropped. If raw is not a dict, it is wrapped as {'raw': str(msg)}.\"}, {\"log_type\": \"RESULT\", \"msg\": \"{ 'event': 'Model Finalized', 'model': <str>, 'time': <float> }\", \"description\": \"Emitted once during exit() using current simulation time from get_current_time().\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name used for identification in logs (stored as self.name via Atomic)."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to the parent coupled model; None indicates this is a root model. Stored as self.parent; otherwise not used in behavior."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "exiting_event_in",
+          "type": "dict",
+          "structure": "Internal exiting log event.\nRequired keys and constraints:\n- time: float (simulation timestamp of exit)\n- station_id: int (must be one of {1,2,3,4,5})\n- direction: int (0=southbound, 1=northbound) [validated but ignored in JSONL output]\n- passenger: dict with required keys:\n  - passenger_id: int\n  - passenger_num: int\n  - origin: int (1..5)\n  - destination: int (1..5, != origin not enforced here)\nInvalid messages are dropped and logged as ERROR.",
+          "protocol": {
+            "initial_state": "Model starts in phase IDLE with sigma=+inf; ready to log at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "On any external transition, for each message received on this port: validate schema; if valid, log exactly one RESULT JSONL event with event='passenger_exiting', entity_type='train_queue', station_id, station name, and payload passenger fields. If invalid, log one ERROR record and drop."
+          }
+        },
+        {
+          "name": "boarding_event_in",
+          "type": "dict",
+          "structure": "Internal boarding log event.\nRequired keys and constraints:\n- time: float (simulation timestamp of boarding)\n- station_id: int (must be one of {1,2,3,4,5})\n- direction: int (0=southbound, 1=northbound) [validated but ignored in JSONL output]\n- passenger: dict with required keys:\n  - passenger_id: int\n  - passenger_num: int\n  - origin: int (1..5)\n  - destination: int (1..5, != origin not enforced here)\nInvalid messages are dropped and logged as ERROR.",
+          "protocol": {
+            "initial_state": "Model starts in phase IDLE with sigma=+inf; ready to log at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "On any external transition, for each message received on this port: validate schema; if valid, log exactly one RESULT JSONL event with event='passenger_boarding', entity_type='station_queue', station_id, station name, and payload passenger fields. If invalid, log one ERROR record and drop."
+          }
+        }
+      ],
+      "output_ports": []
+    }
+  },
+  {
+    "class_name": "ServiceOrchestrator",
+    "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/ServiceOrchestrator.py",
+    "logic_path": "OTrain.StationServiceSystem.ServiceOrchestrator",
+    "specification": {
+      "function": "Coupled DEVS container that wires together four atomic sub-models to orchestrate station servicing per train arrival.\n\nResponsibilities / workflow:\n- Exposes a system boundary (superset of ports) to connect sibling systems (TrainMovementSystem, TrainLoadStore, StationQueueSystem).\n- On each external train arrival, routes it to ArrivalPhaseCoordinator, which emits:\n  - Alighting start command to TrainLoadStore (external output).\n  - Arrival context to AlightingScheduler and BoardingScheduler (internal couplings).\n- Routes alighting completion notifications (both external `alight_complete_in` and internal `AlightingScheduler.alight_complete_out`) to ArrivalPhaseCoordinator, which releases the boarding gate to BoardingScheduler.\n- Routes TrainLoadStore alight-count and exiting-passenger responses to AlightingScheduler.\n- Routes StationQueueSystem dequeue responses to BoardingScheduler.\n- Forwards passenger event streams to PassengerEventLogger for JSONL RESULT logging.\n\nSub-models (class -> instance name):\n- ArrivalPhaseCoordinator -> arrival_phase_coordinator\n- AlightingScheduler -> alighting_scheduler\n- BoardingScheduler -> boarding_scheduler\n- PassengerEventLogger -> passenger_event_logger\n\nCouplings:\n- EIC (external input -> internal):\n  - train_arrival_in -> arrival_phase_coordinator.train_arrival_in\n  - alight_complete_in -> arrival_phase_coordinator.alight_complete_in\n  - alight_count_in -> alighting_scheduler.alight_count_in\n  - exiting_passenger_in -> alighting_scheduler.exiting_passenger_in\n  - dequeue_response_in -> boarding_scheduler.dequeue_response_in\n- IC (internal -> internal):\n  - arrival_phase_coordinator.alight_start_ctx_out -> alighting_scheduler.arrival_ctx_in\n  - arrival_phase_coordinator.board_start_ctx_out -> boarding_scheduler.arrival_ctx_in\n  - arrival_phase_coordinator.alight_done_out -> boarding_scheduler.alight_done_in\n  - alighting_scheduler.alight_complete_out -> arrival_phase_coordinator.alight_complete_in\n  - alighting_scheduler.exiting_event_out -> passenger_event_logger.exiting_event_in\n  - boarding_scheduler.boarding_event_out -> passenger_event_logger.boarding_event_in\n- EOC (internal output -> external output):\n  - arrival_phase_coordinator.alight_start_out -> alight_start_out\n  - alighting_scheduler.pop_exiting_out -> pop_exiting_out\n  - boarding_scheduler.dequeue_request_out -> dequeue_request_out\n  - boarding_scheduler.boarded_passenger_out -> boarded_passenger_out\n\nCommunication protocol notes:\n- Initiation: no initial signals; this coupled model only wires ports; all timing/protocol logic is in the atomic sub-models.\n- Receive/Send: external inputs are immediately routed via couplings; external outputs are produced by sub-models and forwarded via EOC couplings.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'service_time_seconds': <float>, 'param': {'wiring_version': <str>}}\", \"description\": \"Emitted once in `__init__` after ports, sub-model instances, and couplings are created. `param.wiring_version` is hardcoded to '1.0'.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique name of the coupled model instance; passed to Coupled.__init__(name). Used for identification/logging."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to the parent coupled model; None indicates this model is a root. Stored in self.parent; not otherwise used internally."
+        },
+        {
+          "name": "service_time_seconds",
+          "type": "float",
+          "structure": "Per-passenger boarding/alighting service time in seconds. Cast to float and passed to ArrivalPhaseCoordinator, AlightingScheduler, and BoardingScheduler as their `service_time_seconds` initialization argument."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "train_arrival_in",
+          "type": "dict",
+          "structure": "Train arrival notification.\nKeys:\n- station_id (int): Station ID in [1..5]\n- direction (int): 0 (Southbound) or 1 (Northbound)",
+          "protocol": {
+            "initial_state": "Port exists at T=0; no initial buffering in this coupled model.",
+            "initial_signal": "No initial signal.",
+            "description": "Each message is routed (EIC coupling) to ArrivalPhaseCoordinator.train_arrival_in."
+          }
+        },
+        {
+          "name": "alight_count_in",
+          "type": "dict",
+          "structure": "Alighting count response (from TrainLoadStore).\nKeys:\n- station_id (int): Station ID in [1..5]\n- count (int): number of passengers to alight (>=0)",
+          "protocol": {
+            "initial_state": "Port exists at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Each message is routed (EIC coupling) to AlightingScheduler.alight_count_in."
+          }
+        },
+        {
+          "name": "exiting_passenger_in",
+          "type": "dict",
+          "structure": "Next exiting passenger popped from train load (from TrainLoadStore).\nKeys:\n- station_id (int): Station ID in [1..5]\n- has_passenger (bool): True if a passenger was popped\n- passenger (dict): passenger payload if has_passenger else {}\n  - passenger_id (int): encoded passenger ID\n  - passenger_num (int): sequential passenger number\n  - origin (int): Origin station ID in [1..5]\n  - destination (int): Destination station ID in [1..5]",
+          "protocol": {
+            "initial_state": "Port exists at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Each message is routed (EIC coupling) to AlightingScheduler.exiting_passenger_in."
+          }
+        },
+        {
+          "name": "dequeue_response_in",
+          "type": "dict",
+          "structure": "Response from StationQueueSystem for a dequeue request.\nKeys:\n- station_id (int): Station ID in [1..5]\n- has_passenger (bool): True if a passenger was dequeued\n- passenger (dict): passenger payload if has_passenger else {}\n  - passenger_id (int)\n  - passenger_num (int)\n  - origin (int): Origin station ID in [1..5]\n  - destination (int): Destination station ID in [1..5]",
+          "protocol": {
+            "initial_state": "Port exists at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Each message is routed (EIC coupling) to BoardingScheduler.dequeue_response_in."
+          }
+        },
+        {
+          "name": "alight_complete_in",
+          "type": "dict",
+          "structure": "Alighting completion notification.\nKeys:\n- station_id (int): Station ID in [1..5]\n- arrival_time (float): Arrival simulation time (seconds) for which alighting is complete",
+          "protocol": {
+            "initial_state": "Port exists at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Each message is routed (EIC coupling) to ArrivalPhaseCoordinator.alight_complete_in. Note: alight completion also flows internally from AlightingScheduler.alight_complete_out to the same ArrivalPhaseCoordinator input."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "dequeue_request_out",
+          "type": "dict",
+          "structure": "Dequeue request to StationQueueSystem.\nKeys:\n- station_id (int): Station ID in [1..5]",
+          "protocol": {
+            "initial_state": "No output pending at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Forwarded (EOC coupling) from BoardingScheduler.dequeue_request_out."
+          }
+        },
+        {
+          "name": "alight_start_out",
+          "type": "dict",
+          "structure": "Alighting start command to TrainLoadStore.\nKeys:\n- station_id (int): Station ID in [1..5]\n- arrival_time (float): Arrival simulation time (seconds)",
+          "protocol": {
+            "initial_state": "No output pending at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Forwarded (EOC coupling) from ArrivalPhaseCoordinator.alight_start_out."
+          }
+        },
+        {
+          "name": "pop_exiting_out",
+          "type": "dict",
+          "structure": "Command to pop an exiting passenger from TrainLoadStore.\nKeys:\n- station_id (int): Station ID in [1..5]",
+          "protocol": {
+            "initial_state": "No output pending at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Forwarded (EOC coupling) from AlightingScheduler.pop_exiting_out."
+          }
+        },
+        {
+          "name": "boarded_passenger_out",
+          "type": "dict",
+          "structure": "Forward boarded passenger to TrainLoadStore.\nKeys:\n- passenger (dict): Passenger payload to append by destination\n  - passenger_id (int): encoded passenger ID\n  - passenger_num (int): sequential passenger number\n  - origin (int): Origin station ID in [1..5]\n  - destination (int): Destination station ID in [1..5]",
+          "protocol": {
+            "initial_state": "No output pending at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Forwarded (EOC coupling) from BoardingScheduler.boarded_passenger_out."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "StationServiceSystem",
+    "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem.py",
+    "logic_path": "OTrain.StationServiceSystem",
+    "specification": {
+      "function": "Coupled DEVS structural container providing the StationServiceSystem boundary. It wires orchestration logic (ServiceOrchestrator) with in-train passenger storage (TrainLoadStore) and exposes a superset of ports for higher-level/sibling wiring.\n\nSub-models (class -> instance name):\n- ServiceOrchestrator -> service_orchestrator\n- TrainLoadStore -> train_load_store\n\nWorkflow / coupling logic:\n- Initialization (__init__):\n  - Creates system boundary input ports: train_arrival_in, dequeue_response_in, alight_complete_in.\n  - Creates system boundary output ports: dequeue_request_out, alight_start_out, pop_exiting_out, boarded_passenger_out, plus optional exposure outputs alight_count_out and exiting_passenger_out.\n  - Instantiates submodels:\n    - service_orchestrator = ServiceOrchestrator(name='service_orchestrator', parent=self, service_time_seconds=float(service_time_seconds))\n    - train_load_store = TrainLoadStore(name='train_load_store', parent=self)\n  - Adds couplings:\n    - EIC (external input -> internal):\n      - train_arrival_in -> service_orchestrator.train_arrival_in\n      - dequeue_response_in -> service_orchestrator.dequeue_response_in\n      - alight_complete_in -> service_orchestrator.alight_complete_in\n    - IC (internal -> internal):\n      - service_orchestrator.alight_start_out -> train_load_store.alight_start_in\n      - service_orchestrator.pop_exiting_out -> train_load_store.pop_exiting_in\n      - service_orchestrator.boarded_passenger_out -> train_load_store.append_boarded_in\n      - train_load_store.alight_count_out -> service_orchestrator.alight_count_in\n      - train_load_store.exiting_passenger_out -> service_orchestrator.exiting_passenger_in\n    - EOC (internal output -> external output):\n      - service_orchestrator.dequeue_request_out -> dequeue_request_out\n      - service_orchestrator.alight_start_out -> alight_start_out\n      - service_orchestrator.pop_exiting_out -> pop_exiting_out\n      - service_orchestrator.boarded_passenger_out -> boarded_passenger_out\n      - train_load_store.alight_count_out -> alight_count_out (optional exposure)\n      - train_load_store.exiting_passenger_out -> exiting_passenger_out (optional exposure)\n\nCommunication protocol notes:\n- This coupled model does not implement timing/phase logic; it routes messages via couplings.\n- No initial signals are emitted; all dynamic behavior is inside the atomic/coupled sub-models.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'service_time_seconds': <float>, 'param': {'wiring_version': '1.0'}}\", \"description\": \"Emitted once at the end of __init__ after ports, sub-models, and couplings are set up. service_time_seconds is float(service_time_seconds) as passed in; param contains internal hardcoded wiring_version='1.0'.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique name of the coupled model instance; passed to Coupled.__init__(name). Used for identification/logging."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to the parent coupled model. If None, this model is a root model. Stored as self.parent; not otherwise used in wiring logic."
+        },
+        {
+          "name": "service_time_seconds",
+          "type": "float",
+          "structure": "Per-passenger boarding/alighting service time in seconds. Cast to float and forwarded to the ServiceOrchestrator submodel as its initialization argument service_time_seconds."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "train_arrival_in",
+          "type": "dict",
+          "structure": "Train arrival notification from TrainMovementSystem.\nExpected dict keys:\n- station_id: int in [1..5]\n- direction: int, 0 (Southbound) or 1 (Northbound)",
+          "protocol": {
+            "initial_state": "Port exists at T=0; this coupled model does not buffer/process messages itself.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Each incoming message is routed via EIC coupling to ServiceOrchestrator.input['train_arrival_in']."
+          }
+        },
+        {
+          "name": "dequeue_response_in",
+          "type": "dict",
+          "structure": "Dequeue response from StationQueueSystem.\nExpected dict keys:\n- station_id: int in [1..5]\n- has_passenger: bool\n- passenger: dict if has_passenger else {}\n  - passenger_id: int\n  - passenger_num: int\n  - origin: int in [1..5]\n  - destination: int in [1..5]",
+          "protocol": {
+            "initial_state": "Port exists at T=0; this coupled model does not buffer/process messages itself.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Each incoming message is routed via EIC coupling to ServiceOrchestrator.input['dequeue_response_in']."
+          }
+        },
+        {
+          "name": "alight_complete_in",
+          "type": "dict",
+          "structure": "Alighting completion notification (optionally provided by a parent/sibling system).\nExpected dict keys:\n- station_id: int in [1..5]\n- arrival_time: float (simulation time seconds)",
+          "protocol": {
+            "initial_state": "Port exists at T=0; this coupled model does not buffer/process messages itself.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Each incoming message is routed via EIC coupling to ServiceOrchestrator.input['alight_complete_in']."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "dequeue_request_out",
+          "type": "dict",
+          "structure": "Dequeue request to StationQueueSystem.\nExpected dict keys:\n- station_id: int in [1..5]",
+          "protocol": {
+            "initial_state": "No output pending at T=0.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Forwarded via EOC coupling from ServiceOrchestrator.output['dequeue_request_out']."
+          }
+        },
+        {
+          "name": "alight_start_out",
+          "type": "dict",
+          "structure": "Alighting start command to TrainLoadStore.\nExpected dict keys:\n- station_id: int in [1..5]\n- arrival_time: float (simulation time seconds)",
+          "protocol": {
+            "initial_state": "No output pending at T=0.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Forwarded via EOC coupling from ServiceOrchestrator.output['alight_start_out']."
+          }
+        },
+        {
+          "name": "pop_exiting_out",
+          "type": "dict",
+          "structure": "Command to pop an exiting passenger from TrainLoadStore.\nExpected dict keys:\n- station_id: int in [1..5]",
+          "protocol": {
+            "initial_state": "No output pending at T=0.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Forwarded via EOC coupling from ServiceOrchestrator.output['pop_exiting_out']."
+          }
+        },
+        {
+          "name": "boarded_passenger_out",
+          "type": "dict",
+          "structure": "Boarded passenger message to be appended into TrainLoadStore.\nExpected dict keys:\n- passenger: dict\n  - passenger_id: int\n  - passenger_num: int\n  - origin: int in [1..5]\n  - destination: int in [1..5]",
+          "protocol": {
+            "initial_state": "No output pending at T=0.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Forwarded via EOC coupling from ServiceOrchestrator.output['boarded_passenger_out']."
+          }
+        },
+        {
+          "name": "alight_count_out",
+          "type": "dict",
+          "structure": "Alighting count response exposed at system boundary (optional for higher-level wiring/inspection).\nExpected dict keys:\n- station_id: int in [1..5]\n- count: int >= 0",
+          "protocol": {
+            "initial_state": "No output pending at T=0.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Forwarded via EOC coupling from TrainLoadStore.output['alight_count_out']."
+          }
+        },
+        {
+          "name": "exiting_passenger_out",
+          "type": "dict",
+          "structure": "Exiting passenger response exposed at system boundary (optional for higher-level wiring/inspection).\nExpected dict keys:\n- station_id: int in [1..5]\n- has_passenger: bool\n- passenger: dict if has_passenger else {}\n  - passenger_id: int\n  - passenger_num: int\n  - origin: int in [1..5]\n  - destination: int in [1..5]",
+          "protocol": {
+            "initial_state": "No output pending at T=0.",
+            "initial_signal": "No initial signal is sent.",
+            "description": "Forwarded via EOC coupling from TrainLoadStore.output['exiting_passenger_out']."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "OTrain",
+    "file_path": "otrain_model/devs_project/OTrain.py",
+    "logic_path": "OTrain",
+    "specification": {
+      "function": "Top-level coupled DEVS model that acts as a pure structural container (wiring only) for the O-Train simulation.\n\nSub-models (class -> instance name) composed in __init__:\n- PassengerGenerationSystem -> passenger_generation\n- StationQueueSystem -> station_queue\n- TrainMovementSystem -> train_movement\n- StationServiceSystem -> station_service\n\nWorkflow / coupling logic (message routing):\n- Passenger generation -> Station queues:\n  - passenger_generation.output['passenger_out'] -> station_queue.input['passenger_in']\n- Train movement -> Station service (arrival triggers service orchestration):\n  - train_movement.output['train_arrival_out'] -> station_service.input['train_arrival_in']\n- Station service <-> Station queue (dequeue request/response loop):\n  - station_service.output['dequeue_request_out'] -> station_queue.input['dequeue_request_in']\n  - station_queue.output['dequeue_response_out'] -> station_service.input['dequeue_response_in']\n\nNotes / protocol aspects:\n- No system-boundary input or output ports are created on this top-level model.\n- Communication starts implicitly when submodels initialize; this model does not send any explicit start signal.\n- station_service.input['alight_complete_in'] is intentionally left uncoupled at this level (optional for higher-level wiring).\n- This model does not emit required JSONL simulation events itself; submodels handle event emission.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'travel_time_seconds': float, 'service_time_seconds': float, 'gen_mean_minutes': float, 'gen_std_minutes': float, 'gen_min_minutes': float, 'gen_max_minutes': float, 'init_passenger_time_seconds': float, 'param': {'station_map': {'1': str, '2': str, '3': str, '4': str, '5': str}}, 'time': float}\", \"description\": \"Emitted once at the end of __init__ via self.logger.info(..., log_type='PROCESS'), after creating submodels, registering components, and adding couplings. param is a hardcoded dict containing station_map with string keys '1'..'5' mapping to station names. time is the current simulation time from get_current_time() cast to float.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model instance name passed to Coupled.__init__(name)."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to the parent coupled model. If None, this model is a root model. Stored in self.parent; not otherwise used for couplings/logic."
+        },
+        {
+          "name": "travel_time_seconds",
+          "type": "float",
+          "structure": "Constant travel time (seconds) between consecutive stations for the TrainMovementSystem submodel. Default 225.0. Cast to float and passed as TrainMovementSystem(travel_time_seconds=...)."
+        },
+        {
+          "name": "service_time_seconds",
+          "type": "float",
+          "structure": "Per-passenger boarding/alighting service time in seconds for StationServiceSystem/ServiceOrchestrator. Default 0.025. Cast to float and passed as StationServiceSystem(service_time_seconds=...)."
+        },
+        {
+          "name": "gen_mean_minutes",
+          "type": "float",
+          "structure": "Passenger inter-arrival Normal mean (minutes) for PassengerGenerationSystem stochastic generator. Default 5.0. Cast to float and passed through."
+        },
+        {
+          "name": "gen_std_minutes",
+          "type": "float",
+          "structure": "Passenger inter-arrival Normal std (minutes) for PassengerGenerationSystem stochastic generator. Default 5.0. Cast to float and passed through."
+        },
+        {
+          "name": "gen_min_minutes",
+          "type": "float",
+          "structure": "Clamp lower bound (minutes) for sampled inter-arrival times in PassengerGenerationSystem. Default 1.0. Cast to float and passed through."
+        },
+        {
+          "name": "gen_max_minutes",
+          "type": "float",
+          "structure": "Clamp upper bound (minutes) for sampled inter-arrival times in PassengerGenerationSystem. Default 9.0. Cast to float and passed through."
+        },
+        {
+          "name": "init_passenger_time_seconds",
+          "type": "float",
+          "structure": "Time in seconds at which initialization passengers are created (all stations) within PassengerGenerationSystem, and also used as a start gate for stochastic generation in that subsystem. Default 0.5. Cast to float and passed through."
+        }
+      ],
+      "input_ports": [],
+      "output_ports": []
+    }
+  }
+]

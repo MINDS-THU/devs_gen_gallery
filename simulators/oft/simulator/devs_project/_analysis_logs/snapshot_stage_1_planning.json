@@ -1,0 +1,930 @@
+{
+  "stage": "stage_1_planning",
+  "root_model_name": "Offline_File_Transfer",
+  "timestamp": "2026-03-30 04:44:58",
+  "plan_tree": {
+    "class_name": "Offline_File_Transfer",
+    "plan_phase": {
+      "type": "coupled",
+      "model_info": {
+        "class_name": "Offline_File_Transfer",
+        "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer.py",
+        "logic_path": "Offline_File_Transfer",
+        "specification": {
+          "function": "1. Time Unit: 1 unit = 1 second (1000ms). \n2. Internal Components: The model encapsulates a Sender, Server (ServerReceiver + StorageQueue + ServerSender), Receiver, and four Subnets (A1, A2, B1, B2).\n3. Subnet Logic: All subnets (A1, A2, B1, B2) are FIFO and impose a fixed 3s delay on any packet/ACK passing through.\n4. Sender Logic:\n    - Maintain `total_packets_to_send` and `current_bit` (starts at 0).\n    - Upon `control N`: Increment `total_packets_to_send`. If idle, start preparation.\n    - Preparation: 10s delay before sending a new packet.\n    - ABP: Send Packet(seq, bit). Start 20s timeout timer.\n    - On ACK(bit) == current_bit: Stop timer, flip `current_bit`, decrement `total_packets_to_send`, and if > 0, repeat preparation.\n    - On Timeout: Retransmit current Packet(seq, bit) and restart 20s timer.\n5. ServerReceiver Logic:\n    - On packet arrival: Wait 3s processing delay.\n    - If packet_bit == expected_bit: Push to StorageQueue, send ACK(expected_bit) to SubnetA2, flip expected_bit.\n    - If packet_bit != expected_bit: Send ACK(previous_bit) to SubnetA2.\n6. ServerSender Logic:\n    - Condition to send: `download_allowed` is True AND StorageQueue is not empty AND not waiting for an ACK.\n    - Action: Pop packet from queue, send to SubnetB1, start ABP cycle.\n    - Valve: If `download_allowed` becomes False during a cycle, it must complete the current packet-ACK exchange before stopping.\n7. Receiver Logic:\n    - On packet arrival: 10s processing delay (simulating slow write).\n    - After delay: Send ACK(bit) back via SubnetB2.",
+          "logging": "The model must log the following events to the internal logger:\n1. Sender: 'control_cmd' (added, total_remaining), 'preparation_started' (duration=10000), 'packet_sent' (seq, bit, is_retry), 'ack_received' (bit), 'timeout' (seq).\n2. ServerReceiver: 'packet_received' (seq, bit), 'ack_sent_to_sender' (bit).\n3. ServerSender: 'download_valve_change' (allowed), 'packet_forwarded' (seq, bit), 'ack_received_from_receiver' (bit).\n4. Receiver: 'processing_started' (seq, duration=10000), 'ack_sent' (bit).\nAll logs must include 'timestamp_ms' (simulation time in ms) and the specific 'model' name string as per requirements.",
+          "model_init_args": [
+            {
+              "name": "simulation_time",
+              "type": "float",
+              "structure": "Total simulation duration in milliseconds."
+            }
+          ],
+          "input_ports": [
+            {
+              "name": "control_in",
+              "type": "int",
+              "structure": "Integer N representing packets to add to the upload queue.",
+              "protocol": {
+                "initial_state": "0",
+                "initial_signal": "no",
+                "description": "Triggered by 'control' command from stdin."
+              }
+            },
+            {
+              "name": "request_in",
+              "type": "int",
+              "structure": "Binary integer: 1 for allowed, 0 for forbidden.",
+              "protocol": {
+                "initial_state": "0",
+                "initial_signal": "no",
+                "description": "Triggered by 'request' command from stdin to toggle download valve."
+              }
+            }
+          ],
+          "output_ports": []
+        }
+      },
+      "children_plan": [
+        {
+          "class_name": "Sender",
+          "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Sender",
+          "logic_path": "Offline_File_Transfer.Sender",
+          "specification": {
+            "function": "1. Maintain 'total_packets_to_send' and 'current_bit' (starts at 0). 2. Upon receiving 'control N' from 'control_in', increment 'total_packets_to_send'. 3. Preparation: 10s delay (10000ms) before sending a new packet. 4. ABP Logic: Send Packet(seq, bit) to 'packet_out'. Start 20s (20000ms) timeout timer. 5. On ACK(bit) from 'ack_in' == current_bit: Stop timer, flip 'current_bit', decrement 'total_packets_to_send'. If > 0, repeat preparation. 6. On Timeout: Retransmit current Packet and restart 20s timer.",
+            "logging": "Log events: 'control_cmd' (added, total_remaining), 'preparation_started' (duration=10000), 'packet_sent' (seq, bit, is_retry), 'ack_received' (bit), 'timeout' (seq). Include 'timestamp_ms' and 'model' name.",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique instance name."
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "control_in",
+                "type": "int",
+                "structure": "Integer N representing packets to add.",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Receives upload commands from parent."
+                }
+              },
+              {
+                "name": "ack_in",
+                "type": "dict",
+                "structure": "ACK packet containing: 'bit' (int).",
+                "protocol": {
+                  "initial_state": "waiting",
+                  "initial_signal": "no",
+                  "description": "Receives ACKs from Subnet_A2."
+                }
+              }
+            ],
+            "output_ports": [
+              {
+                "name": "packet_out",
+                "type": "dict",
+                "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Sends packets to Subnet_A1."
+                }
+              }
+            ]
+          }
+        },
+        {
+          "class_name": "Server",
+          "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Server",
+          "logic_path": "Offline_File_Transfer.Server",
+          "specification": {
+            "function": "1. ServerReceiver: On packet from 'packet_in', wait 3s processing delay. If packet_bit == expected_bit, push to StorageQueue, send ACK(expected_bit) to 'ack_out', flip expected_bit. If mismatch, send ACK(previous_bit). 2. ServerSender: If 'download_allowed' (from 'request_in') is True, StorageQueue is not empty, and not waiting for ACK, pop packet and send to 'packet_forward_out'. 3. ABP for Forwarding: Start cycle and wait for ACK on 'ack_forward_in'. 4. Valve: If 'download_allowed' becomes False, finish current packet-ACK exchange before stopping.",
+            "logging": "Log events: 'packet_received' (seq, bit), 'ack_sent_to_sender' (bit), 'download_valve_change' (allowed), 'packet_forwarded' (seq, bit), 'ack_received_from_receiver' (bit). Include 'timestamp_ms' and 'model' name.",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique instance name."
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "packet_in",
+                "type": "dict",
+                "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                "protocol": {
+                  "initial_state": "waiting",
+                  "initial_signal": "no",
+                  "description": "Receives packets from Subnet_A1."
+                }
+              },
+              {
+                "name": "request_in",
+                "type": "int",
+                "structure": "1 for allowed, 0 for forbidden.",
+                "protocol": {
+                  "initial_state": "0",
+                  "initial_signal": "no",
+                  "description": "Receives valve control from parent."
+                }
+              },
+              {
+                "name": "ack_forward_in",
+                "type": "dict",
+                "structure": "ACK packet containing: 'bit' (int).",
+                "protocol": {
+                  "initial_state": "waiting",
+                  "initial_signal": "no",
+                  "description": "Receives ACKs from Subnet_B1."
+                }
+              }
+            ],
+            "output_ports": [
+              {
+                "name": "ack_out",
+                "type": "dict",
+                "structure": "ACK packet containing: 'bit' (int).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Sends ACKs to Subnet_A2."
+                }
+              },
+              {
+                "name": "packet_forward_out",
+                "type": "dict",
+                "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Sends packets to Subnet_B1."
+                }
+              }
+            ]
+          }
+        },
+        {
+          "class_name": "Receiver",
+          "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Receiver",
+          "logic_path": "Offline_File_Transfer.Receiver",
+          "specification": {
+            "function": "1. On packet arrival from 'packet_in': 10s processing delay (10000ms). 2. After delay: Send ACK(bit) back via 'ack_out'.",
+            "logging": "Log events: 'processing_started' (seq, duration=10000), 'ack_sent' (bit). Include 'timestamp_ms' and 'model' name.",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique instance name."
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "packet_in",
+                "type": "dict",
+                "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                "protocol": {
+                  "initial_state": "waiting",
+                  "initial_signal": "no",
+                  "description": "Receives packets from Subnet_B1."
+                }
+              }
+            ],
+            "output_ports": [
+              {
+                "name": "ack_out",
+                "type": "dict",
+                "structure": "ACK packet containing: 'bit' (int).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Sends ACKs to Subnet_B2."
+                }
+              }
+            ]
+          }
+        },
+        {
+          "class_name": "Subnet",
+          "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Subnet",
+          "logic_path": "Offline_File_Transfer.Subnet",
+          "specification": {
+            "function": "FIFO queue logic that imposes a fixed 3s (3000ms) delay on any data passing from 'in' to 'out'.",
+            "logging": "No specific logging required by parent for subnets.",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique instance name."
+              },
+              {
+                "name": "delay",
+                "type": "float",
+                "structure": "Delay in milliseconds (fixed at 3000)."
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "in",
+                "type": "dict",
+                "structure": "Any packet or ACK dictionary.",
+                "protocol": {
+                  "initial_state": "empty",
+                  "initial_signal": "no",
+                  "description": "Receives data to be delayed."
+                }
+              }
+            ],
+            "output_ports": [
+              {
+                "name": "out",
+                "type": "dict",
+                "structure": "The same dictionary received at 'in'.",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Sends data after 3s delay."
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "coupling_specification": "1. External Input Coupling (EIC): 'control_in' to sender.control_in; 'request_in' to server.request_in. 2. Internal Coupling (IC): sender.packet_out -> subnet_a1.in -> server.packet_in; server.ack_out -> subnet_a2.in -> sender.ack_in; server.packet_forward_out -> subnet_b1.in -> receiver.packet_in; receiver.ack_out -> subnet_b2.in -> server.ack_forward_in. 3. Multiplicity: Instantiate Subnet as 'subnet_a1', 'subnet_a2', 'subnet_b1', and 'subnet_b2' with delay=3000."
+    },
+    "code_phase": null,
+    "children": [
+      {
+        "class_name": "Sender",
+        "plan_phase": {
+          "type": "atomic",
+          "model_info": {
+            "class_name": "Sender",
+            "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Sender.py",
+            "logic_path": "Offline_File_Transfer.Sender",
+            "specification": {
+              "function": "1. Maintain 'total_packets_to_send' and 'current_bit' (starts at 0). 2. Upon receiving 'control N' from 'control_in', increment 'total_packets_to_send'. 3. Preparation: 10s delay (10000ms) before sending a new packet. 4. ABP Logic: Send Packet(seq, bit) to 'packet_out'. Start 20s (20000ms) timeout timer. 5. On ACK(bit) from 'ack_in' == current_bit: Stop timer, flip 'current_bit', decrement 'total_packets_to_send'. If > 0, repeat preparation. 6. On Timeout: Retransmit current Packet and restart 20s timer.",
+              "logging": "Log events: 'control_cmd' (added, total_remaining), 'preparation_started' (duration=10000), 'packet_sent' (seq, bit, is_retry), 'ack_received' (bit), 'timeout' (seq). Include 'timestamp_ms' and 'model' name.",
+              "model_init_args": [
+                {
+                  "name": "name",
+                  "type": "str",
+                  "structure": "Unique instance name."
+                }
+              ],
+              "input_ports": [
+                {
+                  "name": "control_in",
+                  "type": "int",
+                  "structure": "Integer N representing packets to add.",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Receives upload commands from parent."
+                  }
+                },
+                {
+                  "name": "ack_in",
+                  "type": "dict",
+                  "structure": "ACK packet containing: 'bit' (int).",
+                  "protocol": {
+                    "initial_state": "waiting",
+                    "initial_signal": "no",
+                    "description": "Receives ACKs from Subnet_A2."
+                  }
+                }
+              ],
+              "output_ports": [
+                {
+                  "name": "packet_out",
+                  "type": "dict",
+                  "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Sends packets to Subnet_A1."
+                  }
+                }
+              ]
+            }
+          },
+          "children_plan": [],
+          "coupling_specification": null
+        },
+        "code_phase": null,
+        "children": []
+      },
+      {
+        "class_name": "Server",
+        "plan_phase": {
+          "type": "coupled",
+          "model_info": {
+            "class_name": "Server",
+            "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Server.py",
+            "logic_path": "Offline_File_Transfer.Server",
+            "specification": {
+              "function": "1. ServerReceiver: On packet from 'packet_in', wait 3s processing delay. If packet_bit == expected_bit, push to StorageQueue, send ACK(expected_bit) to 'ack_out', flip expected_bit. If mismatch, send ACK(previous_bit). 2. ServerSender: If 'download_allowed' (from 'request_in') is True, StorageQueue is not empty, and not waiting for ACK, pop packet and send to 'packet_forward_out'. 3. ABP for Forwarding: Start cycle and wait for ACK on 'ack_forward_in'. 4. Valve: If 'download_allowed' becomes False, finish current packet-ACK exchange before stopping.",
+              "logging": "Log events: 'packet_received' (seq, bit), 'ack_sent_to_sender' (bit), 'download_valve_change' (allowed), 'packet_forwarded' (seq, bit), 'ack_received_from_receiver' (bit). Include 'timestamp_ms' and 'model' name.",
+              "model_init_args": [
+                {
+                  "name": "name",
+                  "type": "str",
+                  "structure": "Unique instance name."
+                }
+              ],
+              "input_ports": [
+                {
+                  "name": "packet_in",
+                  "type": "dict",
+                  "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                  "protocol": {
+                    "initial_state": "waiting",
+                    "initial_signal": "no",
+                    "description": "Receives packets from Subnet_A1."
+                  }
+                },
+                {
+                  "name": "request_in",
+                  "type": "int",
+                  "structure": "1 for allowed, 0 for forbidden.",
+                  "protocol": {
+                    "initial_state": "0",
+                    "initial_signal": "no",
+                    "description": "Receives valve control from parent."
+                  }
+                },
+                {
+                  "name": "ack_forward_in",
+                  "type": "dict",
+                  "structure": "ACK packet containing: 'bit' (int).",
+                  "protocol": {
+                    "initial_state": "waiting",
+                    "initial_signal": "no",
+                    "description": "Receives ACKs from Subnet_B1."
+                  }
+                }
+              ],
+              "output_ports": [
+                {
+                  "name": "ack_out",
+                  "type": "dict",
+                  "structure": "ACK packet containing: 'bit' (int).",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Sends ACKs to Subnet_A2."
+                  }
+                },
+                {
+                  "name": "packet_forward_out",
+                  "type": "dict",
+                  "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Sends packets to Subnet_B1."
+                  }
+                }
+              ]
+            }
+          },
+          "children_plan": [
+            {
+              "class_name": "ServerReceiver",
+              "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Server_libs/ServerReceiver",
+              "logic_path": "Offline_File_Transfer.Server.ServerReceiver",
+              "specification": {
+                "function": "1. Monitors 'packet_in' for incoming packets. 2. Implements a 3s (3000ms) processing delay upon packet arrival. 3. Maintains an 'expected_bit' (initially 0). 4. If packet_bit == expected_bit: Push the packet (seq, bit) to 'storage_out', send ACK(expected_bit) to 'ack_out', and flip 'expected_bit'. 5. If packet_bit != expected_bit: Send ACK(previous_bit) to 'ack_out' without pushing to storage.",
+                "logging": "Log events: 'packet_received' (fields: seq, bit), 'ack_sent_to_sender' (fields: bit). Include 'timestamp_ms' and 'model' name.",
+                "model_init_args": [
+                  {
+                    "name": "name",
+                    "type": "str",
+                    "structure": "Unique instance name."
+                  },
+                  {
+                    "name": "processing_delay",
+                    "type": "float",
+                    "structure": "Fixed delay of 3.0 seconds."
+                  }
+                ],
+                "input_ports": [
+                  {
+                    "name": "packet_in",
+                    "type": "dict",
+                    "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                    "protocol": {
+                      "initial_state": "waiting",
+                      "initial_signal": "no",
+                      "description": "Receives packets from the parent's packet_in port."
+                    }
+                  }
+                ],
+                "output_ports": [
+                  {
+                    "name": "storage_out",
+                    "type": "dict",
+                    "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Sends valid packets to the StorageQueue sibling."
+                    }
+                  },
+                  {
+                    "name": "ack_out",
+                    "type": "dict",
+                    "structure": "ACK packet containing: 'bit' (int).",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Sends ACKs to the parent's ack_out port."
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "class_name": "StorageQueue",
+              "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Server_libs/StorageQueue",
+              "logic_path": "Offline_File_Transfer.Server.StorageQueue",
+              "specification": {
+                "function": "1. Acts as a FIFO buffer for packets received from ServerReceiver. 2. On 'packet_in', store packet. 3. On 'pop_request', if queue is not empty, emit the oldest packet to 'packet_out'.",
+                "logging": "No specific logging required by parent for this component.",
+                "model_init_args": [
+                  {
+                    "name": "name",
+                    "type": "str",
+                    "structure": "Unique instance name."
+                  }
+                ],
+                "input_ports": [
+                  {
+                    "name": "packet_in",
+                    "type": "dict",
+                    "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                    "protocol": {
+                      "initial_state": "empty",
+                      "initial_signal": "no",
+                      "description": "Receives packets from ServerReceiver:storage_out."
+                    }
+                  },
+                  {
+                    "name": "pop_request",
+                    "type": "bool",
+                    "structure": "Boolean signal to pop a packet.",
+                    "protocol": {
+                      "initial_state": "waiting",
+                      "initial_signal": "no",
+                      "description": "Receives requests from ServerSender:queue_pop_req."
+                    }
+                  }
+                ],
+                "output_ports": [
+                  {
+                    "name": "packet_out",
+                    "type": "dict",
+                    "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Sends popped packet to ServerSender:queue_packet_in."
+                    }
+                  },
+                  {
+                    "name": "is_empty",
+                    "type": "bool",
+                    "structure": "True if queue is empty, False otherwise.",
+                    "protocol": {
+                      "initial_state": "True",
+                      "initial_signal": "no",
+                      "description": "Status signal to ServerSender:queue_empty_status."
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "class_name": "ServerSender",
+              "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Server_libs/ServerSender",
+              "logic_path": "Offline_File_Transfer.Server.ServerSender",
+              "specification": {
+                "function": "1. Manages the download valve state based on 'request_in' (1=allowed, 0=forbidden). 2. Logic to initiate forwarding: If download_allowed is True AND StorageQueue is not empty AND not waiting for an ACK, send 'pop_request' to StorageQueue. 3. ABP Forwarding: Upon receiving packet from queue, send to 'packet_forward_out' and wait for ACK on 'ack_forward_in'. 4. Valve Integrity: If download_allowed becomes False, it must finish the current packet-ACK exchange before stopping further transmissions.",
+                "logging": "Log events: 'download_valve_change' (fields: allowed), 'packet_forwarded' (fields: seq, bit), 'ack_received_from_receiver' (fields: bit). Include 'timestamp_ms' and 'model' name.",
+                "model_init_args": [
+                  {
+                    "name": "name",
+                    "type": "str",
+                    "structure": "Unique instance name."
+                  }
+                ],
+                "input_ports": [
+                  {
+                    "name": "request_in",
+                    "type": "int",
+                    "structure": "1 for allowed, 0 for forbidden.",
+                    "protocol": {
+                      "initial_state": "0",
+                      "initial_signal": "no",
+                      "description": "Receives valve control from parent's request_in."
+                    }
+                  },
+                  {
+                    "name": "queue_packet_in",
+                    "type": "dict",
+                    "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                    "protocol": {
+                      "initial_state": "waiting",
+                      "initial_signal": "no",
+                      "description": "Receives packet from StorageQueue:packet_out."
+                    }
+                  },
+                  {
+                    "name": "queue_empty_status",
+                    "type": "bool",
+                    "structure": "Status of the sibling queue.",
+                    "protocol": {
+                      "initial_state": "True",
+                      "initial_signal": "no",
+                      "description": "Receives status from StorageQueue:is_empty."
+                    }
+                  },
+                  {
+                    "name": "ack_forward_in",
+                    "type": "dict",
+                    "structure": "ACK packet containing: 'bit' (int).",
+                    "protocol": {
+                      "initial_state": "waiting",
+                      "initial_signal": "no",
+                      "description": "Receives ACKs from parent's ack_forward_in."
+                    }
+                  }
+                ],
+                "output_ports": [
+                  {
+                    "name": "queue_pop_req",
+                    "type": "bool",
+                    "structure": "Signal to pop packet.",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Sends pop request to StorageQueue:pop_request."
+                    }
+                  },
+                  {
+                    "name": "packet_forward_out",
+                    "type": "dict",
+                    "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Sends packets to parent's packet_forward_out."
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "coupling_specification": "The Server model is decomposed into three components: receiver (ServerReceiver), queue (StorageQueue), and sender (ServerSender). 1. External Input Couplings: Parent 'packet_in' connects to receiver:packet_in; Parent 'request_in' connects to sender:request_in; Parent 'ack_forward_in' connects to sender:ack_forward_in. 2. Internal Couplings: receiver:storage_out connects to queue:packet_in; sender:queue_pop_req connects to queue:pop_request; queue:packet_out connects to sender:queue_packet_in; queue:is_empty connects to sender:queue_empty_status. 3. External Output Couplings: receiver:ack_out connects to parent 'ack_out'; sender:packet_forward_out connects to parent 'packet_forward_out'."
+        },
+        "code_phase": null,
+        "children": [
+          {
+            "class_name": "ServerReceiver",
+            "plan_phase": {
+              "type": "atomic",
+              "model_info": {
+                "class_name": "ServerReceiver",
+                "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Server_libs/ServerReceiver.py",
+                "logic_path": "Offline_File_Transfer.Server.ServerReceiver",
+                "specification": {
+                  "function": "1. Monitors 'packet_in' for incoming packets. 2. Implements a 3s (3000ms) processing delay upon packet arrival. 3. Maintains an 'expected_bit' (initially 0). 4. If packet_bit == expected_bit: Push the packet (seq, bit) to 'storage_out', send ACK(expected_bit) to 'ack_out', and flip 'expected_bit'. 5. If packet_bit != expected_bit: Send ACK(previous_bit) to 'ack_out' without pushing to storage.",
+                  "logging": "Log events: 'packet_received' (fields: seq, bit), 'ack_sent_to_sender' (fields: bit). Include 'timestamp_ms' and 'model' name.",
+                  "model_init_args": [
+                    {
+                      "name": "name",
+                      "type": "str",
+                      "structure": "Unique instance name."
+                    },
+                    {
+                      "name": "processing_delay",
+                      "type": "float",
+                      "structure": "Fixed delay of 3.0 seconds."
+                    }
+                  ],
+                  "input_ports": [
+                    {
+                      "name": "packet_in",
+                      "type": "dict",
+                      "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                      "protocol": {
+                        "initial_state": "waiting",
+                        "initial_signal": "no",
+                        "description": "Receives packets from the parent's packet_in port."
+                      }
+                    }
+                  ],
+                  "output_ports": [
+                    {
+                      "name": "storage_out",
+                      "type": "dict",
+                      "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                      "protocol": {
+                        "initial_state": "idle",
+                        "initial_signal": "no",
+                        "description": "Sends valid packets to the StorageQueue sibling."
+                      }
+                    },
+                    {
+                      "name": "ack_out",
+                      "type": "dict",
+                      "structure": "ACK packet containing: 'bit' (int).",
+                      "protocol": {
+                        "initial_state": "idle",
+                        "initial_signal": "no",
+                        "description": "Sends ACKs to the parent's ack_out port."
+                      }
+                    }
+                  ]
+                }
+              },
+              "children_plan": [],
+              "coupling_specification": null
+            },
+            "code_phase": null,
+            "children": []
+          },
+          {
+            "class_name": "StorageQueue",
+            "plan_phase": {
+              "type": "atomic",
+              "model_info": {
+                "class_name": "StorageQueue",
+                "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Server_libs/StorageQueue.py",
+                "logic_path": "Offline_File_Transfer.Server.StorageQueue",
+                "specification": {
+                  "function": "1. Acts as a FIFO buffer for packets received from ServerReceiver. 2. On 'packet_in', store packet. 3. On 'pop_request', if queue is not empty, emit the oldest packet to 'packet_out'.",
+                  "logging": "No specific logging required by parent for this component.",
+                  "model_init_args": [
+                    {
+                      "name": "name",
+                      "type": "str",
+                      "structure": "Unique instance name."
+                    }
+                  ],
+                  "input_ports": [
+                    {
+                      "name": "packet_in",
+                      "type": "dict",
+                      "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                      "protocol": {
+                        "initial_state": "empty",
+                        "initial_signal": "no",
+                        "description": "Receives packets from ServerReceiver:storage_out."
+                      }
+                    },
+                    {
+                      "name": "pop_request",
+                      "type": "bool",
+                      "structure": "Boolean signal to pop a packet.",
+                      "protocol": {
+                        "initial_state": "waiting",
+                        "initial_signal": "no",
+                        "description": "Receives requests from ServerSender:queue_pop_req."
+                      }
+                    }
+                  ],
+                  "output_ports": [
+                    {
+                      "name": "packet_out",
+                      "type": "dict",
+                      "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                      "protocol": {
+                        "initial_state": "idle",
+                        "initial_signal": "no",
+                        "description": "Sends popped packet to ServerSender:queue_packet_in."
+                      }
+                    },
+                    {
+                      "name": "is_empty",
+                      "type": "bool",
+                      "structure": "True if queue is empty, False otherwise.",
+                      "protocol": {
+                        "initial_state": "True",
+                        "initial_signal": "no",
+                        "description": "Status signal to ServerSender:queue_empty_status."
+                      }
+                    }
+                  ]
+                }
+              },
+              "children_plan": [],
+              "coupling_specification": null
+            },
+            "code_phase": null,
+            "children": []
+          },
+          {
+            "class_name": "ServerSender",
+            "plan_phase": {
+              "type": "atomic",
+              "model_info": {
+                "class_name": "ServerSender",
+                "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Server_libs/ServerSender.py",
+                "logic_path": "Offline_File_Transfer.Server.ServerSender",
+                "specification": {
+                  "function": "1. Manages the download valve state based on 'request_in' (1=allowed, 0=forbidden). 2. Logic to initiate forwarding: If download_allowed is True AND StorageQueue is not empty AND not waiting for an ACK, send 'pop_request' to StorageQueue. 3. ABP Forwarding: Upon receiving packet from queue, send to 'packet_forward_out' and wait for ACK on 'ack_forward_in'. 4. Valve Integrity: If download_allowed becomes False, it must finish the current packet-ACK exchange before stopping further transmissions.",
+                  "logging": "Log events: 'download_valve_change' (fields: allowed), 'packet_forwarded' (fields: seq, bit), 'ack_received_from_receiver' (fields: bit). Include 'timestamp_ms' and 'model' name.",
+                  "model_init_args": [
+                    {
+                      "name": "name",
+                      "type": "str",
+                      "structure": "Unique instance name."
+                    }
+                  ],
+                  "input_ports": [
+                    {
+                      "name": "request_in",
+                      "type": "int",
+                      "structure": "1 for allowed, 0 for forbidden.",
+                      "protocol": {
+                        "initial_state": "0",
+                        "initial_signal": "no",
+                        "description": "Receives valve control from parent's request_in."
+                      }
+                    },
+                    {
+                      "name": "queue_packet_in",
+                      "type": "dict",
+                      "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                      "protocol": {
+                        "initial_state": "waiting",
+                        "initial_signal": "no",
+                        "description": "Receives packet from StorageQueue:packet_out."
+                      }
+                    },
+                    {
+                      "name": "queue_empty_status",
+                      "type": "bool",
+                      "structure": "Status of the sibling queue.",
+                      "protocol": {
+                        "initial_state": "True",
+                        "initial_signal": "no",
+                        "description": "Receives status from StorageQueue:is_empty."
+                      }
+                    },
+                    {
+                      "name": "ack_forward_in",
+                      "type": "dict",
+                      "structure": "ACK packet containing: 'bit' (int).",
+                      "protocol": {
+                        "initial_state": "waiting",
+                        "initial_signal": "no",
+                        "description": "Receives ACKs from parent's ack_forward_in."
+                      }
+                    }
+                  ],
+                  "output_ports": [
+                    {
+                      "name": "queue_pop_req",
+                      "type": "bool",
+                      "structure": "Signal to pop packet.",
+                      "protocol": {
+                        "initial_state": "idle",
+                        "initial_signal": "no",
+                        "description": "Sends pop request to StorageQueue:pop_request."
+                      }
+                    },
+                    {
+                      "name": "packet_forward_out",
+                      "type": "dict",
+                      "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                      "protocol": {
+                        "initial_state": "idle",
+                        "initial_signal": "no",
+                        "description": "Sends packets to parent's packet_forward_out."
+                      }
+                    }
+                  ]
+                }
+              },
+              "children_plan": [],
+              "coupling_specification": null
+            },
+            "code_phase": null,
+            "children": []
+          }
+        ]
+      },
+      {
+        "class_name": "Receiver",
+        "plan_phase": {
+          "type": "atomic",
+          "model_info": {
+            "class_name": "Receiver",
+            "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Receiver.py",
+            "logic_path": "Offline_File_Transfer.Receiver",
+            "specification": {
+              "function": "1. On packet arrival from 'packet_in': 10s processing delay (10000ms). 2. After delay: Send ACK(bit) back via 'ack_out'.",
+              "logging": "Log events: 'processing_started' (seq, duration=10000), 'ack_sent' (bit). Include 'timestamp_ms' and 'model' name.",
+              "model_init_args": [
+                {
+                  "name": "name",
+                  "type": "str",
+                  "structure": "Unique instance name."
+                }
+              ],
+              "input_ports": [
+                {
+                  "name": "packet_in",
+                  "type": "dict",
+                  "structure": "Packet containing: 'seq' (int), 'bit' (int).",
+                  "protocol": {
+                    "initial_state": "waiting",
+                    "initial_signal": "no",
+                    "description": "Receives packets from Subnet_B1."
+                  }
+                }
+              ],
+              "output_ports": [
+                {
+                  "name": "ack_out",
+                  "type": "dict",
+                  "structure": "ACK packet containing: 'bit' (int).",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Sends ACKs to Subnet_B2."
+                  }
+                }
+              ]
+            }
+          },
+          "children_plan": [],
+          "coupling_specification": null
+        },
+        "code_phase": null,
+        "children": []
+      },
+      {
+        "class_name": "Subnet",
+        "plan_phase": {
+          "type": "atomic",
+          "model_info": {
+            "class_name": "Subnet",
+            "file_path": "offline_file_transfer/devs_project/Offline_File_Transfer_libs/Subnet.py",
+            "logic_path": "Offline_File_Transfer.Subnet",
+            "specification": {
+              "function": "FIFO queue logic that imposes a fixed 3s (3000ms) delay on any data passing from 'in' to 'out'.",
+              "logging": "No specific logging required by parent for subnets.",
+              "model_init_args": [
+                {
+                  "name": "name",
+                  "type": "str",
+                  "structure": "Unique instance name."
+                },
+                {
+                  "name": "delay",
+                  "type": "float",
+                  "structure": "Delay in milliseconds (fixed at 3000)."
+                }
+              ],
+              "input_ports": [
+                {
+                  "name": "in",
+                  "type": "dict",
+                  "structure": "Any packet or ACK dictionary.",
+                  "protocol": {
+                    "initial_state": "empty",
+                    "initial_signal": "no",
+                    "description": "Receives data to be delayed."
+                  }
+                }
+              ],
+              "output_ports": [
+                {
+                  "name": "out",
+                  "type": "dict",
+                  "structure": "The same dictionary received at 'in'.",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Sends data after 3s delay."
+                  }
+                }
+              ]
+            }
+          },
+          "children_plan": [],
+          "coupling_specification": null
+        },
+        "code_phase": null,
+        "children": []
+      }
+    ]
+  },
+  "flat_registry_view": {},
+  "stage_report": ""
+}

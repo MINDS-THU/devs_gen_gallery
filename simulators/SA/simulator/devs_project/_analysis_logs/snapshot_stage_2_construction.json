@@ -1,0 +1,1775 @@
+{
+  "stage": "stage_2_construction",
+  "root_model_name": "StrategicAirlift_D0",
+  "timestamp": "2026-03-30 04:44:23",
+  "plan_tree": {
+    "class_name": "StrategicAirlift_D0",
+    "plan_phase": {
+      "type": "coupled",
+      "model_info": {
+        "class_name": "StrategicAirlift_D0",
+        "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0.py",
+        "logic_path": "StrategicAirlift_D0",
+        "specification": {
+          "function": "1. Time Unit: 1.0 unit = 1.0 second.\n2. Facility Logic: Generates a pallet every `pallet_interval`. Each pallet is assigned a unique `pallet_id` and an absolute `expiration_time` = (current_time + `pallet_expiration_time`).\n3. Loading Queue Logic: \n   - Maintains a FIFO queue of pallets.\n   - Active Expiration: Monitors the head of the queue. If `current_time` reaches a pallet's `expiration_time`, the pallet is removed immediately and a `pallet_expired` event is logged.\n4. Fleet Coordinator Logic:\n   - Tracks aircraft states: IDLE, FLYING, UNLOADING, RETURNING, MAINTENANCE.\n   - Assignment Rule: If (Queue is not empty) AND (at least one Aircraft is IDLE), assign the first pallet in the queue to the IDLE aircraft (FIFO for both).\n5. Aircraft Cycle Logic:\n   - IDLE: Waits for assignment from Coordinator.\n   - LOADING: Instantaneous (0s). Triggers `depart` event immediately upon assignment.\n   - FLYING: Takes `flight_time`. Transitions to UNLOADING.\n   - UNLOADING: Takes `unload_time`. At the end of this duration, triggers `pallet_delivered` event.\n   - RETURNING: Takes `return_time`. At the end, triggers `return` event.\n   - MAINTENANCE: Takes `maintenance_time`. Starts immediately after return. Triggers `maintenance_start` at beginning and `maintenance_end` at completion.\n   - Completion: After maintenance, aircraft returns to IDLE state and notifies Coordinator.\n6. Latency Calculation: `latency` = `delivery_time` (end of unload) - `generation_time`.",
+          "logging": "The model must log the following events to the internal logger for the controller to output as JSONL:\n- `pallet_generated`: {time, entity: 'facility', payload: {pallet_id, expiration_time}}\n- `pallet_queued`: {time, entity: 'queue', payload: {pallet_id, queue_size}}\n- `pallet_expired`: {time, entity: 'queue', payload: {pallet_id, total_expired}}\n- `assignment_created`: {time, entity: 'coordinator', payload: {aircraft_id, pallet_id}}\n- `depart`: {time, entity: 'aircraft', payload: {aircraft_id, pallet_id}}\n- `pallet_delivered`: {time, entity: 'destination', payload: {pallet_id, aircraft_id, latency}}\n- `return`: {time, entity: 'aircraft', payload: {aircraft_id}}\n- `maintenance_start`: {time, entity: 'aircraft', payload: {aircraft_id}}\n- `maintenance_end`: {time, entity: 'aircraft', payload: {aircraft_id}}",
+          "model_init_args": [
+            {
+              "name": "num_aircraft",
+              "type": "int",
+              "structure": "Integer >= 1"
+            },
+            {
+              "name": "pallet_interval",
+              "type": "float",
+              "structure": "Time interval between generations"
+            },
+            {
+              "name": "pallet_expiration_time",
+              "type": "float",
+              "structure": "Relative duration until a pallet expires in queue"
+            },
+            {
+              "name": "flight_time",
+              "type": "float",
+              "structure": "Duration of outbound flight"
+            },
+            {
+              "name": "unload_time",
+              "type": "float",
+              "structure": "Duration of unloading at destination"
+            },
+            {
+              "name": "return_time",
+              "type": "float",
+              "structure": "Duration of return flight"
+            },
+            {
+              "name": "maintenance_time",
+              "type": "float",
+              "structure": "Duration of maintenance phase"
+            }
+          ],
+          "input_ports": [],
+          "output_ports": []
+        }
+      },
+      "children_plan": [
+        {
+          "class_name": "PalletFacility",
+          "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/PalletFacility",
+          "logic_path": "StrategicAirlift_D0.PalletFacility",
+          "specification": {
+            "function": "1. Time Unit: 1.0 unit = 1.0 second. 2. Generates a pallet every 'pallet_interval'. 3. Each pallet is assigned a unique 'pallet_id' and an absolute 'expiration_time' = (current_time + 'pallet_expiration_time'). 4. Also records the 'generation_time' for later latency calculation.",
+            "logging": "- `pallet_generated`: {time, entity: 'facility', payload: {pallet_id, expiration_time}}",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique name of the model instance"
+              },
+              {
+                "name": "pallet_interval",
+                "type": "float",
+                "structure": "Time interval between generations"
+              },
+              {
+                "name": "pallet_expiration_time",
+                "type": "float",
+                "structure": "Relative duration until a pallet expires in queue"
+              }
+            ],
+            "input_ports": [],
+            "output_ports": [
+              {
+                "name": "pallet_out",
+                "type": "dict",
+                "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Sends a pallet dictionary to [PalletQueue: pallet_in] every pallet_interval."
+                }
+              }
+            ]
+          }
+        },
+        {
+          "class_name": "PalletQueue",
+          "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/PalletQueue",
+          "logic_path": "StrategicAirlift_D0.PalletQueue",
+          "specification": {
+            "function": "1. Maintains a FIFO queue of pallets received from PalletFacility. 2. Active Expiration: Monitors the head of the queue. If current_time reaches a pallet's expiration_time, the pallet is removed immediately. 3. When requested by the Coordinator via 'request_pallet', if the queue is not empty, it pops the head and sends it to the Coordinator.",
+            "logging": "- `pallet_queued`: {time, entity: 'queue', payload: {pallet_id, queue_size}}\n- `pallet_expired`: {time, entity: 'queue', payload: {pallet_id, total_expired}}",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique name of the model instance"
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "pallet_in",
+                "type": "dict",
+                "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                "protocol": {
+                  "initial_state": "empty",
+                  "initial_signal": "no",
+                  "description": "Receives pallets from [PalletFacility: pallet_out]."
+                }
+              },
+              {
+                "name": "request_pallet",
+                "type": "bool",
+                "structure": "Boolean trigger signal.",
+                "protocol": {
+                  "initial_state": "waiting",
+                  "initial_signal": "no",
+                  "description": "Receives request from [FleetCoordinator: queue_request] to release the next valid pallet."
+                }
+              }
+            ],
+            "output_ports": [
+              {
+                "name": "pallet_out",
+                "type": "dict",
+                "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Sends the popped pallet to [FleetCoordinator: pallet_in]."
+                }
+              },
+              {
+                "name": "queue_status",
+                "type": "int",
+                "structure": "Current size of the queue.",
+                "protocol": {
+                  "initial_state": "0",
+                  "initial_signal": "no",
+                  "description": "Notifies [FleetCoordinator: queue_size_in] of the current queue length after any change (arrival, expiration, or removal)."
+                }
+              }
+            ]
+          }
+        },
+        {
+          "class_name": "FleetCoordinator",
+          "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/FleetCoordinator",
+          "logic_path": "StrategicAirlift_D0.FleetCoordinator",
+          "specification": {
+            "function": "1. Tracks aircraft states for multiple aircraft instances. 2. Assignment Rule: If (Queue size > 0) AND (at least one Aircraft is IDLE), it sends a 'request_pallet' to the Queue. 3. Upon receiving a pallet, it assigns it to the first available IDLE aircraft (FIFO).",
+            "logging": "- `assignment_created`: {time, entity: 'coordinator', payload: {aircraft_id, pallet_id}}",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique name of the model instance"
+              },
+              {
+                "name": "num_aircraft",
+                "type": "int",
+                "structure": "Total number of aircraft to track."
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "queue_size_in",
+                "type": "int",
+                "structure": "Integer representing pallets in queue.",
+                "protocol": {
+                  "initial_state": "0",
+                  "initial_signal": "no",
+                  "description": "Receives updates from [PalletQueue: queue_status]."
+                }
+              },
+              {
+                "name": "pallet_in",
+                "type": "dict",
+                "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                "protocol": {
+                  "initial_state": "waiting",
+                  "initial_signal": "no",
+                  "description": "Receives the pallet released by [PalletQueue: pallet_out] for assignment."
+                }
+              },
+              {
+                "name": "aircraft_ready_{i}",
+                "type": "str",
+                "structure": "The aircraft_id (str) of the aircraft that just finished maintenance.",
+                "protocol": {
+                  "initial_state": "all_ready",
+                  "initial_signal": "no",
+                  "description": "Receives ready signals from [Aircraft_{i}: ready_out]."
+                }
+              }
+            ],
+            "output_ports": [
+              {
+                "name": "queue_request",
+                "type": "bool",
+                "structure": "Boolean trigger.",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Sends request to [PalletQueue: request_pallet] when an aircraft is free and queue is not empty."
+                }
+              },
+              {
+                "name": "assign_to_aircraft_{i}",
+                "type": "dict",
+                "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Dispatches the pallet to the specific [Aircraft_{i}: assignment_in]."
+                }
+              }
+            ]
+          }
+        },
+        {
+          "class_name": "Aircraft",
+          "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft",
+          "logic_path": "StrategicAirlift_D0.Aircraft",
+          "specification": {
+            "function": "1. Cycle Logic: IDLE -> LOADING (0s, triggers 'depart') -> FLYING (flight_time) -> UNLOADING (unload_time, triggers 'pallet_delivered' and calculates latency) -> RETURNING (return_time, triggers 'return') -> MAINTENANCE (maintenance_time, triggers 'maintenance_start'/'maintenance_end'). 2. After maintenance, sends 'ready' signal. 3. Latency = delivery_time - generation_time.",
+            "logging": "- `depart`: {time, entity: 'aircraft', payload: {aircraft_id, pallet_id}}\n- `pallet_delivered`: {time, entity: 'destination', payload: {pallet_id, aircraft_id, latency}}\n- `return`: {time, entity: 'aircraft', payload: {aircraft_id}}\n- `maintenance_start`: {time, entity: 'aircraft', payload: {aircraft_id}}\n- `maintenance_end`: {time, entity: 'aircraft', payload: {aircraft_id}}",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique aircraft_id"
+              },
+              {
+                "name": "flight_time",
+                "type": "float",
+                "structure": "Duration of outbound flight"
+              },
+              {
+                "name": "unload_time",
+                "type": "float",
+                "structure": "Duration of unloading"
+              },
+              {
+                "name": "return_time",
+                "type": "float",
+                "structure": "Duration of return flight"
+              },
+              {
+                "name": "maintenance_time",
+                "type": "float",
+                "structure": "Duration of maintenance"
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "assignment_in",
+                "type": "dict",
+                "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Receives assignment from [FleetCoordinator: assign_to_aircraft_{i}]."
+                }
+              }
+            ],
+            "output_ports": [
+              {
+                "name": "ready_out",
+                "type": "str",
+                "structure": "The aircraft_id of this instance.",
+                "protocol": {
+                  "initial_state": "ready",
+                  "initial_signal": "Sends its aircraft_id to [FleetCoordinator: aircraft_ready_{i}] at T=0 to register as IDLE.",
+                  "description": "Signals availability to the Coordinator after initialization and after every maintenance cycle."
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "coupling_specification": "1. PalletFacility:pallet_out connects to PalletQueue:pallet_in. 2. PalletQueue:queue_status connects to FleetCoordinator:queue_size_in. 3. FleetCoordinator:queue_request connects to PalletQueue:request_pallet. 4. PalletQueue:pallet_out connects to FleetCoordinator:pallet_in. 5. Instantiate 'num_aircraft' instances of Aircraft as aircraft_0 to aircraft_{num_aircraft-1}. 6. For each aircraft_i: FleetCoordinator:assign_to_aircraft_i connects to aircraft_i:assignment_in, and aircraft_i:ready_out connects to FleetCoordinator:aircraft_ready_i. 7. To prevent cold-start deadlock, each Aircraft instance sends an initial 'ready' signal at T=0 so the Coordinator knows which aircraft are available for the first assignments."
+    },
+    "code_phase": {
+      "class_name": "StrategicAirlift_D0",
+      "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0.py",
+      "logic_path": "StrategicAirlift_D0",
+      "specification": {
+        "function": "Simulates an airfreight logistics system including cargo generation, queuing, coordination, and aircraft delivery cycles. It manages the end-to-end flow from pallet creation at a facility to delivery at a destination. Sub-models: 1. PalletFacility (instance: 'facility'): Generates pallets at regular intervals. 2. PalletQueue (instance: 'queue'): Manages FIFO storage and active expiration of pallets. 3. FleetCoordinator (instance: 'coordinator'): Matches available aircraft with queued pallets. 4. Aircraft (instances: 'aircraft_{i}'): Represents individual transport units (1 to num_aircraft). The model couples these components to allow pallets to flow from the facility to the queue, and then to specific aircraft as assigned by the coordinator.",
+        "logging": "event: Model Created. log_type: PROCESS. msg (dict): Configuration parameters of the system including num_aircraft (int), pallet_interval (float), pallet_expiration_time (float), flight_time (float), unload_time (float), return_time (float), and maintenance_time (float).",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "The unique name of the model instance."
+          },
+          {
+            "name": "parent",
+            "type": "Coupled | None",
+            "structure": "The parent model (None for root)."
+          },
+          {
+            "name": "num_aircraft",
+            "type": "int",
+            "structure": "Total number of aircraft to simulate; determines the number of Aircraft sub-model instances."
+          },
+          {
+            "name": "pallet_interval",
+            "type": "float",
+            "structure": "Seconds between pallet generations in the PalletFacility."
+          },
+          {
+            "name": "pallet_expiration_time",
+            "type": "float",
+            "structure": "Seconds until a pallet expires in the PalletQueue."
+          },
+          {
+            "name": "flight_time",
+            "type": "float",
+            "structure": "Seconds for the flying phase of the Aircraft."
+          },
+          {
+            "name": "unload_time",
+            "type": "float",
+            "structure": "Seconds for the unloading phase of the Aircraft."
+          },
+          {
+            "name": "return_time",
+            "type": "float",
+            "structure": "Seconds for the returning phase of the Aircraft."
+          },
+          {
+            "name": "maintenance_time",
+            "type": "float",
+            "structure": "Seconds for the maintenance phase of the Aircraft."
+          }
+        ],
+        "input_ports": [],
+        "output_ports": []
+      }
+    },
+    "children": [
+      {
+        "class_name": "PalletFacility",
+        "plan_phase": {
+          "type": "atomic",
+          "model_info": {
+            "class_name": "PalletFacility",
+            "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/PalletFacility.py",
+            "logic_path": "StrategicAirlift_D0.PalletFacility",
+            "specification": {
+              "function": "1. Time Unit: 1.0 unit = 1.0 second. 2. Generates a pallet every 'pallet_interval'. 3. Each pallet is assigned a unique 'pallet_id' and an absolute 'expiration_time' = (current_time + 'pallet_expiration_time'). 4. Also records the 'generation_time' for later latency calculation.",
+              "logging": "- `pallet_generated`: {time, entity: 'facility', payload: {pallet_id, expiration_time}}",
+              "model_init_args": [
+                {
+                  "name": "name",
+                  "type": "str",
+                  "structure": "Unique name of the model instance"
+                },
+                {
+                  "name": "pallet_interval",
+                  "type": "float",
+                  "structure": "Time interval between generations"
+                },
+                {
+                  "name": "pallet_expiration_time",
+                  "type": "float",
+                  "structure": "Relative duration until a pallet expires in queue"
+                }
+              ],
+              "input_ports": [],
+              "output_ports": [
+                {
+                  "name": "pallet_out",
+                  "type": "dict",
+                  "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Sends a pallet dictionary to [PalletQueue: pallet_in] every pallet_interval."
+                  }
+                }
+              ]
+            }
+          },
+          "children_plan": [],
+          "coupling_specification": null
+        },
+        "code_phase": {
+          "class_name": "PalletFacility",
+          "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/PalletFacility.py",
+          "logic_path": "StrategicAirlift_D0.PalletFacility",
+          "specification": {
+            "function": "The model generates a cargo pallet every 'pallet_interval' seconds. Upon initialization, it schedules the first generation at t=0. During each generation cycle, it assigns a unique incrementing 'pallet_id', calculates an absolute 'expiration_time' (current time + pallet_expiration_time), and records the 'generation_time'. The model operates in a continuous cycle: it prepares the pallet data, outputs it via the 'pallet_out' port, logs the generation event, and then schedules the next internal transition based on the 'pallet_interval'.",
+            "logging": "pallet_generated: Triggered when a new pallet is created. log_type: 'PROCESS'. Structure: { 'time': float, 'entity': 'facility', 'event': 'pallet_generated', 'payload': { 'pallet_id': int, 'expiration_time': float } }. Additional logs include 'Model Created', 'Model Initialized' (log_type: 'PROCESS'), and 'Simulation Finished' (log_type: 'RESULT').",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "The unique identifier for the model instance."
+              },
+              {
+                "name": "parent",
+                "type": "Coupled | None",
+                "structure": "The parent coupled model instance or None if it is the root."
+              },
+              {
+                "name": "pallet_interval",
+                "type": "float",
+                "structure": "A positive float representing the time duration between the generation of consecutive pallets."
+              },
+              {
+                "name": "pallet_expiration_time",
+                "type": "float",
+                "structure": "A relative duration (float) added to the current simulation time to determine the pallet's absolute expiration deadline."
+              }
+            ],
+            "input_ports": [],
+            "output_ports": [
+              {
+                "name": "pallet_out",
+                "type": "dict",
+                "structure": "A dictionary containing: 'pallet_id' (int), 'expiration_time' (float - absolute simulation time), and 'generation_time' (float - absolute simulation time).",
+                "protocol": {
+                  "initial_state": "IDLE",
+                  "initial_signal": "no",
+                  "description": "Initializes at t=0 to the GENERATING phase. Every 'pallet_interval', it sends a dictionary representing the pallet to the connected model (e.g., PalletQueue)."
+                }
+              }
+            ]
+          }
+        },
+        "children": []
+      },
+      {
+        "class_name": "PalletQueue",
+        "plan_phase": {
+          "type": "atomic",
+          "model_info": {
+            "class_name": "PalletQueue",
+            "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/PalletQueue.py",
+            "logic_path": "StrategicAirlift_D0.PalletQueue",
+            "specification": {
+              "function": "1. Maintains a FIFO queue of pallets received from PalletFacility. 2. Active Expiration: Monitors the head of the queue. If current_time reaches a pallet's expiration_time, the pallet is removed immediately. 3. When requested by the Coordinator via 'request_pallet', if the queue is not empty, it pops the head and sends it to the Coordinator.",
+              "logging": "- `pallet_queued`: {time, entity: 'queue', payload: {pallet_id, queue_size}}\n- `pallet_expired`: {time, entity: 'queue', payload: {pallet_id, total_expired}}",
+              "model_init_args": [
+                {
+                  "name": "name",
+                  "type": "str",
+                  "structure": "Unique name of the model instance"
+                }
+              ],
+              "input_ports": [
+                {
+                  "name": "pallet_in",
+                  "type": "dict",
+                  "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                  "protocol": {
+                    "initial_state": "empty",
+                    "initial_signal": "no",
+                    "description": "Receives pallets from [PalletFacility: pallet_out]."
+                  }
+                },
+                {
+                  "name": "request_pallet",
+                  "type": "bool",
+                  "structure": "Boolean trigger signal.",
+                  "protocol": {
+                    "initial_state": "waiting",
+                    "initial_signal": "no",
+                    "description": "Receives request from [FleetCoordinator: queue_request] to release the next valid pallet."
+                  }
+                }
+              ],
+              "output_ports": [
+                {
+                  "name": "pallet_out",
+                  "type": "dict",
+                  "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Sends the popped pallet to [FleetCoordinator: pallet_in]."
+                  }
+                },
+                {
+                  "name": "queue_status",
+                  "type": "int",
+                  "structure": "Current size of the queue.",
+                  "protocol": {
+                    "initial_state": "0",
+                    "initial_signal": "no",
+                    "description": "Notifies [FleetCoordinator: queue_size_in] of the current queue length after any change (arrival, expiration, or removal)."
+                  }
+                }
+              ]
+            }
+          },
+          "children_plan": [],
+          "coupling_specification": null
+        },
+        "code_phase": {
+          "class_name": "PalletQueue",
+          "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/PalletQueue.py",
+          "logic_path": "StrategicAirlift_D0.PalletQueue",
+          "specification": {
+            "function": "Maintains a FIFO queue of pallets. It monitors the head of the queue for expiration; if the current simulation time reaches a pallet's expiration_time, the pallet is removed and a 'pallet_expired' event is logged. It responds to 'request_pallet' signals from a Coordinator: if the queue is not empty, it pops the head pallet and sends it via 'pallet_out'. After any change in the queue (arrival, expiration, or removal), it outputs the current size via 'queue_status'.",
+            "logging": "pallet_queued: Triggered when a pallet enters the queue. payload includes pallet_id (int) and queue_size (int). pallet_expired: Triggered when a pallet's deadline is reached. payload includes pallet_id (int) and total_expired (int). log_type is 'PROCESS'.",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "Unique name of the model instance."
+              },
+              {
+                "name": "parent",
+                "type": "Coupled | None",
+                "structure": "The parent coupled model instance."
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "pallet_in",
+                "type": "dict",
+                "structure": "A dictionary containing: pallet_id (int), expiration_time (float), and generation_time (float).",
+                "protocol": {
+                  "initial_state": "empty",
+                  "initial_signal": "no",
+                  "description": "Receives pallets from PalletFacility and adds them to the FIFO queue."
+                }
+              },
+              {
+                "name": "request_pallet",
+                "type": "bool",
+                "structure": "Boolean flag indicating a request for a pallet.",
+                "protocol": {
+                  "initial_state": "waiting",
+                  "initial_signal": "no",
+                  "description": "Trigger from Coordinator to release a pallet. If queue is not empty, pops the head."
+                }
+              }
+            ],
+            "output_ports": [
+              {
+                "name": "pallet_out",
+                "type": "dict",
+                "structure": "A dictionary containing: pallet_id (int), expiration_time (float), and generation_time (float).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Sends the popped pallet data to the Coordinator."
+                }
+              },
+              {
+                "name": "queue_status",
+                "type": "int",
+                "structure": "Integer representing the current number of pallets in the queue.",
+                "protocol": {
+                  "initial_state": "0",
+                  "initial_signal": "no",
+                  "description": "Sends the current queue size after any change (arrival, expiration, or removal)."
+                }
+              }
+            ]
+          }
+        },
+        "children": []
+      },
+      {
+        "class_name": "FleetCoordinator",
+        "plan_phase": {
+          "type": "atomic",
+          "model_info": {
+            "class_name": "FleetCoordinator",
+            "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/FleetCoordinator.py",
+            "logic_path": "StrategicAirlift_D0.FleetCoordinator",
+            "specification": {
+              "function": "1. Tracks aircraft states for multiple aircraft instances. 2. Assignment Rule: If (Queue size > 0) AND (at least one Aircraft is IDLE), it sends a 'request_pallet' to the Queue. 3. Upon receiving a pallet, it assigns it to the first available IDLE aircraft (FIFO).",
+              "logging": "- `assignment_created`: {time, entity: 'coordinator', payload: {aircraft_id, pallet_id}}",
+              "model_init_args": [
+                {
+                  "name": "name",
+                  "type": "str",
+                  "structure": "Unique name of the model instance"
+                },
+                {
+                  "name": "num_aircraft",
+                  "type": "int",
+                  "structure": "Total number of aircraft to track."
+                }
+              ],
+              "input_ports": [
+                {
+                  "name": "queue_size_in",
+                  "type": "int",
+                  "structure": "Integer representing pallets in queue.",
+                  "protocol": {
+                    "initial_state": "0",
+                    "initial_signal": "no",
+                    "description": "Receives updates from [PalletQueue: queue_status]."
+                  }
+                },
+                {
+                  "name": "pallet_in",
+                  "type": "dict",
+                  "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                  "protocol": {
+                    "initial_state": "waiting",
+                    "initial_signal": "no",
+                    "description": "Receives the pallet released by [PalletQueue: pallet_out] for assignment."
+                  }
+                },
+                {
+                  "name": "aircraft_ready_{i}",
+                  "type": "str",
+                  "structure": "The aircraft_id (str) of the aircraft that just finished maintenance.",
+                  "protocol": {
+                    "initial_state": "all_ready",
+                    "initial_signal": "no",
+                    "description": "Receives ready signals from [Aircraft_{i}: ready_out]."
+                  }
+                }
+              ],
+              "output_ports": [
+                {
+                  "name": "queue_request",
+                  "type": "bool",
+                  "structure": "Boolean trigger.",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Sends request to [PalletQueue: request_pallet] when an aircraft is free and queue is not empty."
+                  }
+                },
+                {
+                  "name": "assign_to_aircraft_{i}",
+                  "type": "dict",
+                  "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Dispatches the pallet to the specific [Aircraft_{i}: assignment_in]."
+                  }
+                }
+              ]
+            }
+          },
+          "children_plan": [],
+          "coupling_specification": null
+        },
+        "code_phase": {
+          "class_name": "FleetCoordinator",
+          "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/FleetCoordinator.py",
+          "logic_path": "StrategicAirlift_D0.FleetCoordinator",
+          "specification": {
+            "function": "The FleetCoordinator tracks aircraft states (IDLE or BUSY) and monitors a loading queue. Its logic follows an assignment rule: if the Queue size > 0 and at least one aircraft is IDLE, it transitions to REQUESTING and sends a 'queue_request' signal. Upon receiving pallet data on 'pallet_in', it selects the first available IDLE aircraft (FIFO), transitions to ASSIGNING, and forwards the pallet data to the specific 'assign_to_aircraft_{i}' port. It then marks that aircraft as BUSY. When an aircraft finishes maintenance, it receives a signal on 'aircraft_ready_{i}' to mark that aircraft as IDLE again.",
+            "logging": "assignment_created: Triggered when a pallet is dispatched to an aircraft. log_type: 'PROCESS'. Structure: {'time': float, 'entity': 'coordinator', 'event': 'assignment_created', 'payload': {'aircraft_id': int, 'pallet_id': int}}",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "The unique name of the model instance."
+              },
+              {
+                "name": "parent",
+                "type": "Coupled | None",
+                "structure": "The parent coupled model instance."
+              },
+              {
+                "name": "num_aircraft",
+                "type": "int",
+                "structure": "Total number of aircraft to track. This determines the number of dynamic ports created (1 to num_aircraft)."
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "queue_size_in",
+                "type": "int",
+                "structure": "Integer representing the current number of pallets in the external queue.",
+                "protocol": {
+                  "initial_state": "0",
+                  "initial_signal": "no",
+                  "description": "Updates the internal current_queue_size state variable."
+                }
+              },
+              {
+                "name": "pallet_in",
+                "type": "dict",
+                "structure": "Pallet info dictionary containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                "protocol": {
+                  "initial_state": "waiting",
+                  "initial_signal": "no",
+                  "description": "Receives the pallet released by the queue after a request."
+                }
+              },
+              {
+                "name": "aircraft_ready_{i}",
+                "type": "str",
+                "structure": "The aircraft_id of the aircraft that just finished maintenance. Port index {i} ranges from 1 to num_aircraft.",
+                "protocol": {
+                  "initial_state": "all_ready",
+                  "initial_signal": "no",
+                  "description": "Marks the specific aircraft index as IDLE in the internal state."
+                }
+              }
+            ],
+            "output_ports": [
+              {
+                "name": "queue_request",
+                "type": "bool",
+                "structure": "Boolean trigger (True).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Sends True to the queue to request a pallet release."
+                }
+              },
+              {
+                "name": "assign_to_aircraft_{i}",
+                "type": "dict",
+                "structure": "Pallet info dictionary containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float). Port index {i} ranges from 1 to num_aircraft.",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Forwards pallet data to the specific aircraft identified as available."
+                }
+              }
+            ]
+          }
+        },
+        "children": []
+      },
+      {
+        "class_name": "Aircraft",
+        "plan_phase": {
+          "type": "coupled",
+          "model_info": {
+            "class_name": "Aircraft",
+            "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft.py",
+            "logic_path": "StrategicAirlift_D0.Aircraft",
+            "specification": {
+              "function": "1. Cycle Logic: IDLE -> LOADING (0s, triggers 'depart') -> FLYING (flight_time) -> UNLOADING (unload_time, triggers 'pallet_delivered' and calculates latency) -> RETURNING (return_time, triggers 'return') -> MAINTENANCE (maintenance_time, triggers 'maintenance_start'/'maintenance_end'). 2. After maintenance, sends 'ready' signal. 3. Latency = delivery_time - generation_time.",
+              "logging": "- `depart`: {time, entity: 'aircraft', payload: {aircraft_id, pallet_id}}\n- `pallet_delivered`: {time, entity: 'destination', payload: {pallet_id, aircraft_id, latency}}\n- `return`: {time, entity: 'aircraft', payload: {aircraft_id}}\n- `maintenance_start`: {time, entity: 'aircraft', payload: {aircraft_id}}\n- `maintenance_end`: {time, entity: 'aircraft', payload: {aircraft_id}}",
+              "model_init_args": [
+                {
+                  "name": "name",
+                  "type": "str",
+                  "structure": "Unique aircraft_id"
+                },
+                {
+                  "name": "flight_time",
+                  "type": "float",
+                  "structure": "Duration of outbound flight"
+                },
+                {
+                  "name": "unload_time",
+                  "type": "float",
+                  "structure": "Duration of unloading"
+                },
+                {
+                  "name": "return_time",
+                  "type": "float",
+                  "structure": "Duration of return flight"
+                },
+                {
+                  "name": "maintenance_time",
+                  "type": "float",
+                  "structure": "Duration of maintenance"
+                }
+              ],
+              "input_ports": [
+                {
+                  "name": "assignment_in",
+                  "type": "dict",
+                  "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                  "protocol": {
+                    "initial_state": "idle",
+                    "initial_signal": "no",
+                    "description": "Receives assignment from [FleetCoordinator: assign_to_aircraft_{i}]."
+                  }
+                }
+              ],
+              "output_ports": [
+                {
+                  "name": "ready_out",
+                  "type": "str",
+                  "structure": "The aircraft_id of this instance.",
+                  "protocol": {
+                    "initial_state": "ready",
+                    "initial_signal": "Sends its aircraft_id to [FleetCoordinator: aircraft_ready_{i}] at T=0 to register as IDLE.",
+                    "description": "Signals availability to the Coordinator after initialization and after every maintenance cycle."
+                  }
+                }
+              ]
+            }
+          },
+          "children_plan": [
+            {
+              "class_name": "MissionController",
+              "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft_libs/MissionController",
+              "logic_path": "StrategicAirlift_D0.Aircraft.MissionController",
+              "specification": {
+                "function": "1. Cycle Logic Management: Transitions through IDLE, LOADING, FLYING, UNLOADING, RETURNING, and MAINTENANCE. 2. LOADING: Instantaneous (0s) upon receiving 'assignment_in'. Immediately triggers 'depart' event and starts the 'flight_timer'. 3. FLYING: After 'flight_time', transitions to UNLOADING. 4. UNLOADING: After 'unload_time', triggers 'pallet_delivered' event, calculates latency (current_time - generation_time), and starts 'return_timer'. 5. RETURNING: After 'return_time', triggers 'return' event and starts 'maintenance_timer'. 6. MAINTENANCE: After 'maintenance_time', triggers 'maintenance_end' and sends 'ready_out' signal to return to IDLE. 7. Triggers 'maintenance_start' at the beginning of the maintenance phase.",
+                "logging": "- `depart`: {time, entity: 'aircraft', payload: {aircraft_id, pallet_id}}\n- `pallet_delivered`: {time, entity: 'destination', payload: {pallet_id, aircraft_id, latency}}\n- `return`: {time, entity: 'aircraft', payload: {aircraft_id}}\n- `maintenance_start`: {time, entity: 'aircraft', payload: {aircraft_id}}\n- `maintenance_end`: {time, entity: 'aircraft', payload: {aircraft_id}}",
+                "model_init_args": [
+                  {
+                    "name": "name",
+                    "type": "str",
+                    "structure": "Unique aircraft_id"
+                  }
+                ],
+                "input_ports": [
+                  {
+                    "name": "assignment_in",
+                    "type": "dict",
+                    "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Receives assignment from [Parent: assignment_in]."
+                    }
+                  },
+                  {
+                    "name": "timer_done",
+                    "type": "str",
+                    "structure": "String identifier of the completed phase: 'flight', 'unload', 'return', or 'maintenance'.",
+                    "protocol": {
+                      "initial_state": "waiting",
+                      "initial_signal": "no",
+                      "description": "Receives completion signal from [FlightTimer: timeout]."
+                    }
+                  }
+                ],
+                "output_ports": [
+                  {
+                    "name": "start_timer",
+                    "type": "dict",
+                    "structure": "Timer request containing 'phase' (str) and 'duration' (float).",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Sends phase duration to [FlightTimer: start_timer] to initiate timed transitions."
+                    }
+                  },
+                  {
+                    "name": "ready_out",
+                    "type": "str",
+                    "structure": "The aircraft_id of this instance.",
+                    "protocol": {
+                      "initial_state": "ready",
+                      "initial_signal": "Sends its aircraft_id to [Parent: ready_out] at T=0.",
+                      "description": "Signals availability to the Parent output port at T=0 and after maintenance."
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "class_name": "FlightTimer",
+              "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft_libs/FlightTimer",
+              "logic_path": "StrategicAirlift_D0.Aircraft.FlightTimer",
+              "specification": {
+                "function": "1. Receives a duration and a phase label. 2. After the specified duration elapses, it outputs the phase label to notify the controller that the specific flight or ground operation is complete.",
+                "logging": "No specific logging required for the timer component.",
+                "model_init_args": [
+                  {
+                    "name": "name",
+                    "type": "str",
+                    "structure": "Instance name."
+                  },
+                  {
+                    "name": "flight_time",
+                    "type": "float",
+                    "structure": "Duration of outbound flight"
+                  },
+                  {
+                    "name": "unload_time",
+                    "type": "float",
+                    "structure": "Duration of unloading"
+                  },
+                  {
+                    "name": "return_time",
+                    "type": "float",
+                    "structure": "Duration of return flight"
+                  },
+                  {
+                    "name": "maintenance_time",
+                    "type": "float",
+                    "structure": "Duration of maintenance"
+                  }
+                ],
+                "input_ports": [
+                  {
+                    "name": "start_timer",
+                    "type": "dict",
+                    "structure": "Timer request containing 'phase' (str) and 'duration' (float).",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Receives duration from [MissionController: start_timer]."
+                    }
+                  }
+                ],
+                "output_ports": [
+                  {
+                    "name": "timeout",
+                    "type": "str",
+                    "structure": "The phase name that just completed.",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Sends completion signal back to [MissionController: timer_done]."
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "coupling_specification": "1. External Input Coupling (EIC): Parent 'assignment_in' connects to MissionController 'assignment_in'. 2. Internal Coupling (IC): MissionController 'start_timer' connects to FlightTimer 'start_timer'; FlightTimer 'timeout' connects to MissionController 'timer_done'. 3. External Output Coupling (EOC): MissionController 'ready_out' connects to Parent 'ready_out'. To prevent cold-start deadlock, MissionController is configured to send an initial 'ready_out' signal at T=0."
+        },
+        "code_phase": {
+          "class_name": "Aircraft",
+          "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft.py",
+          "logic_path": "StrategicAirlift_D0.Aircraft",
+          "specification": {
+            "function": "Represents a single aircraft entity in the logistics system. It manages the full flight cycle including Loading, Flying, Unloading, Returning, and Maintenance by coordinating between its sub-models. Sub-models: 1. MissionController (instance name: 'controller'): Manages operational states and business logic. 2. FlightTimer (instance name: 'timer'): Handles timed durations for flight phases. The model couples external assignments to the controller, internal timer commands between the controller and timer, and signals availability (ready_out) from the controller to the external system.",
+            "logging": "log_type: PROCESS. Event: 'Model Created'. Message structure: { 'event': 'Model Created', 'aircraft_id': int, 'flight_time': float, 'unload_time': float, 'return_time': float, 'maintenance_time': float }.",
+            "model_init_args": [
+              {
+                "name": "name",
+                "type": "str",
+                "structure": "The unique name of the model instance."
+              },
+              {
+                "name": "parent",
+                "type": "Coupled | None",
+                "structure": "The parent coupled model reference."
+              },
+              {
+                "name": "aircraft_id",
+                "type": "int",
+                "structure": "Unique integer ID assigned to the aircraft."
+              },
+              {
+                "name": "flight_time",
+                "type": "float",
+                "structure": "Duration for the FLYING phase in simulation time units."
+              },
+              {
+                "name": "unload_time",
+                "type": "float",
+                "structure": "Duration for the UNLOADING phase in simulation time units."
+              },
+              {
+                "name": "return_time",
+                "type": "float",
+                "structure": "Duration for the RETURNING phase in simulation time units."
+              },
+              {
+                "name": "maintenance_time",
+                "type": "float",
+                "structure": "Duration for the MAINTENANCE phase in simulation time units."
+              }
+            ],
+            "input_ports": [
+              {
+                "name": "assignment_in",
+                "type": "dict",
+                "structure": "Expected keys: 'pallet_id' (int), 'expiration_time' (float), 'generation_time' (float).",
+                "protocol": {
+                  "initial_state": "idle",
+                  "initial_signal": "no",
+                  "description": "Receives pallet info from the Coordinator and triggers the loading/flight cycle."
+                }
+              }
+            ],
+            "output_ports": [
+              {
+                "name": "ready_out",
+                "type": "str",
+                "structure": "The string representation of the aircraft_id.",
+                "protocol": {
+                  "initial_state": "sending",
+                  "initial_signal": "Sends aircraft_id at T=0",
+                  "description": "Signals aircraft availability to the Coordinator at initialization and after maintenance completion."
+                }
+              }
+            ]
+          }
+        },
+        "children": [
+          {
+            "class_name": "MissionController",
+            "plan_phase": {
+              "type": "atomic",
+              "model_info": {
+                "class_name": "MissionController",
+                "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft_libs/MissionController.py",
+                "logic_path": "StrategicAirlift_D0.Aircraft.MissionController",
+                "specification": {
+                  "function": "1. Cycle Logic Management: Transitions through IDLE, LOADING, FLYING, UNLOADING, RETURNING, and MAINTENANCE. 2. LOADING: Instantaneous (0s) upon receiving 'assignment_in'. Immediately triggers 'depart' event and starts the 'flight_timer'. 3. FLYING: After 'flight_time', transitions to UNLOADING. 4. UNLOADING: After 'unload_time', triggers 'pallet_delivered' event, calculates latency (current_time - generation_time), and starts 'return_timer'. 5. RETURNING: After 'return_time', triggers 'return' event and starts 'maintenance_timer'. 6. MAINTENANCE: After 'maintenance_time', triggers 'maintenance_end' and sends 'ready_out' signal to return to IDLE. 7. Triggers 'maintenance_start' at the beginning of the maintenance phase.",
+                  "logging": "- `depart`: {time, entity: 'aircraft', payload: {aircraft_id, pallet_id}}\n- `pallet_delivered`: {time, entity: 'destination', payload: {pallet_id, aircraft_id, latency}}\n- `return`: {time, entity: 'aircraft', payload: {aircraft_id}}\n- `maintenance_start`: {time, entity: 'aircraft', payload: {aircraft_id}}\n- `maintenance_end`: {time, entity: 'aircraft', payload: {aircraft_id}}",
+                  "model_init_args": [
+                    {
+                      "name": "name",
+                      "type": "str",
+                      "structure": "Unique aircraft_id"
+                    }
+                  ],
+                  "input_ports": [
+                    {
+                      "name": "assignment_in",
+                      "type": "dict",
+                      "structure": "Pallet info containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+                      "protocol": {
+                        "initial_state": "idle",
+                        "initial_signal": "no",
+                        "description": "Receives assignment from [Parent: assignment_in]."
+                      }
+                    },
+                    {
+                      "name": "timer_done",
+                      "type": "str",
+                      "structure": "String identifier of the completed phase: 'flight', 'unload', 'return', or 'maintenance'.",
+                      "protocol": {
+                        "initial_state": "waiting",
+                        "initial_signal": "no",
+                        "description": "Receives completion signal from [FlightTimer: timeout]."
+                      }
+                    }
+                  ],
+                  "output_ports": [
+                    {
+                      "name": "start_timer",
+                      "type": "dict",
+                      "structure": "Timer request containing 'phase' (str) and 'duration' (float).",
+                      "protocol": {
+                        "initial_state": "idle",
+                        "initial_signal": "no",
+                        "description": "Sends phase duration to [FlightTimer: start_timer] to initiate timed transitions."
+                      }
+                    },
+                    {
+                      "name": "ready_out",
+                      "type": "str",
+                      "structure": "The aircraft_id of this instance.",
+                      "protocol": {
+                        "initial_state": "ready",
+                        "initial_signal": "Sends its aircraft_id to [Parent: ready_out] at T=0.",
+                        "description": "Signals availability to the Parent output port at T=0 and after maintenance."
+                      }
+                    }
+                  ]
+                }
+              },
+              "children_plan": [],
+              "coupling_specification": null
+            },
+            "code_phase": {
+              "class_name": "MissionController",
+              "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft_libs/MissionController.py",
+              "logic_path": "StrategicAirlift_D0.Aircraft.MissionController",
+              "specification": {
+                "function": "Manages the operational cycle of an aircraft through states: IDLE, LOADING, FLYING, UNLOADING, RETURNING, and MAINTENANCE. It starts by sending a 'ready_out' signal at T=0. Upon receiving a pallet assignment, it transitions through LOADING (instantaneous), triggers a 'depart' event, and initiates a sequence of timed phases (flight, unload, return, maintenance) using an external timer. It logs key operational events like departure, delivery (with latency calculation), return, and maintenance periods. After maintenance, it signals availability again via 'ready_out'.",
+                "logging": "log_type: PROCESS. Events logged: 1. depart: {time, entity: 'aircraft', payload: {aircraft_id, pallet_id}}; 2. pallet_delivered: {time, entity: 'destination', payload: {pallet_id, aircraft_id, latency}}; 3. return: {time, entity: 'aircraft', payload: {aircraft_id}}; 4. maintenance_start: {time, entity: 'aircraft', payload: {aircraft_id}}; 5. maintenance_end: {time, entity: 'aircraft', payload: {aircraft_id}}.",
+                "model_init_args": [
+                  {
+                    "name": "name",
+                    "type": "str",
+                    "structure": "Unique string identifier for the model instance."
+                  },
+                  {
+                    "name": "parent",
+                    "type": "Coupled | None",
+                    "structure": "Reference to the parent coupled model."
+                  },
+                  {
+                    "name": "aircraft_id",
+                    "type": "int",
+                    "structure": "Unique integer ID assigned to the aircraft."
+                  },
+                  {
+                    "name": "flight_time",
+                    "type": "float",
+                    "structure": "Duration (in time units) for the FLYING phase."
+                  },
+                  {
+                    "name": "unload_time",
+                    "type": "float",
+                    "structure": "Duration (in time units) for the UNLOADING phase."
+                  },
+                  {
+                    "name": "return_time",
+                    "type": "float",
+                    "structure": "Duration (in time units) for the RETURNING phase."
+                  },
+                  {
+                    "name": "maintenance_time",
+                    "type": "float",
+                    "structure": "Duration (in time units) for the MAINTENANCE phase."
+                  }
+                ],
+                "input_ports": [
+                  {
+                    "name": "assignment_in",
+                    "type": "dict",
+                    "structure": "Expected keys: 'pallet_id' (int), 'expiration_time' (float), 'generation_time' (float).",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Receives pallet data from Coordinator; triggers immediate transition to LOADING phase."
+                    }
+                  },
+                  {
+                    "name": "timer_done",
+                    "type": "str",
+                    "structure": "A string identifying the completed phase: 'flight', 'unload', 'return', or 'maintenance'.",
+                    "protocol": {
+                      "initial_state": "waiting",
+                      "initial_signal": "no",
+                      "description": "Signal from external FlightTimer indicating a timed phase has finished."
+                    }
+                  }
+                ],
+                "output_ports": [
+                  {
+                    "name": "start_timer",
+                    "type": "dict",
+                    "structure": "Contains 'phase' (str) and 'duration' (float).",
+                    "protocol": {
+                      "initial_state": "idle",
+                      "initial_signal": "no",
+                      "description": "Commands the FlightTimer to start a countdown for a specific operational phase."
+                    }
+                  },
+                  {
+                    "name": "ready_out",
+                    "type": "str",
+                    "structure": "The string representation of the aircraft_id.",
+                    "protocol": {
+                      "initial_state": "sending",
+                      "initial_signal": "Sends aircraft_id at T=0",
+                      "description": "Signals availability to the system at initialization and after completing maintenance."
+                    }
+                  }
+                ]
+              }
+            },
+            "children": []
+          },
+          {
+            "class_name": "FlightTimer",
+            "plan_phase": {
+              "type": "atomic",
+              "model_info": {
+                "class_name": "FlightTimer",
+                "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft_libs/FlightTimer.py",
+                "logic_path": "StrategicAirlift_D0.Aircraft.FlightTimer",
+                "specification": {
+                  "function": "1. Receives a duration and a phase label. 2. After the specified duration elapses, it outputs the phase label to notify the controller that the specific flight or ground operation is complete.",
+                  "logging": "No specific logging required for the timer component.",
+                  "model_init_args": [
+                    {
+                      "name": "name",
+                      "type": "str",
+                      "structure": "Instance name."
+                    },
+                    {
+                      "name": "flight_time",
+                      "type": "float",
+                      "structure": "Duration of outbound flight"
+                    },
+                    {
+                      "name": "unload_time",
+                      "type": "float",
+                      "structure": "Duration of unloading"
+                    },
+                    {
+                      "name": "return_time",
+                      "type": "float",
+                      "structure": "Duration of return flight"
+                    },
+                    {
+                      "name": "maintenance_time",
+                      "type": "float",
+                      "structure": "Duration of maintenance"
+                    }
+                  ],
+                  "input_ports": [
+                    {
+                      "name": "start_timer",
+                      "type": "dict",
+                      "structure": "Timer request containing 'phase' (str) and 'duration' (float).",
+                      "protocol": {
+                        "initial_state": "idle",
+                        "initial_signal": "no",
+                        "description": "Receives duration from [MissionController: start_timer]."
+                      }
+                    }
+                  ],
+                  "output_ports": [
+                    {
+                      "name": "timeout",
+                      "type": "str",
+                      "structure": "The phase name that just completed.",
+                      "protocol": {
+                        "initial_state": "idle",
+                        "initial_signal": "no",
+                        "description": "Sends completion signal back to [MissionController: timer_done]."
+                      }
+                    }
+                  ]
+                }
+              },
+              "children_plan": [],
+              "coupling_specification": null
+            },
+            "code_phase": {
+              "class_name": "FlightTimer",
+              "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft_libs/FlightTimer.py",
+              "logic_path": "StrategicAirlift_D0.Aircraft.FlightTimer",
+              "specification": {
+                "function": "The FlightTimer model acts as a countdown mechanism for flight and ground operations. It receives a duration and a phase label from the MissionController. Upon receiving a 'start_timer' request, it transitions from IDLE to BUSY and schedules an internal timeout based on the provided duration. Once the duration elapses, it outputs the phase label through the 'timeout' port to notify the system that the operation is complete, then returns to the IDLE state.",
+                "logging": "The model logs lifecycle events. Specifically, it logs 'Model Created' with initialization parameters, 'Model Initialized', and 'Model Exited' upon simulation end. Log type is 'PROCESS' and the message structure includes 'event', 'params' (during creation), and 'time'.",
+                "model_init_args": [
+                  {
+                    "name": "name",
+                    "type": "str",
+                    "structure": "The unique identifier for the model instance."
+                  },
+                  {
+                    "name": "parent",
+                    "type": "Coupled | None",
+                    "structure": "Reference to the parent coupled model or None if it is the root."
+                  },
+                  {
+                    "name": "flight_time",
+                    "type": "float",
+                    "structure": "Duration of outbound flight in simulation time units."
+                  },
+                  {
+                    "name": "unload_time",
+                    "type": "float",
+                    "structure": "Duration of unloading operations in simulation time units."
+                  },
+                  {
+                    "name": "return_time",
+                    "type": "float",
+                    "structure": "Duration of return flight in simulation time units."
+                  },
+                  {
+                    "name": "maintenance_time",
+                    "type": "float",
+                    "structure": "Duration of maintenance operations in simulation time units."
+                  }
+                ],
+                "input_ports": [
+                  {
+                    "name": "start_timer",
+                    "type": "dict",
+                    "structure": "A dictionary containing: 'phase' (str) - the name of the flight phase (e.g., 'flying', 'unloading'); 'duration' (float) - the time duration to wait.",
+                    "protocol": {
+                      "initial_state": "IDLE",
+                      "initial_signal": "no",
+                      "description": "Starts a countdown based on the duration provided in the message. The model transitions to BUSY state."
+                    }
+                  }
+                ],
+                "output_ports": [
+                  {
+                    "name": "timeout",
+                    "type": "str",
+                    "structure": "The name of the phase (str) that has just completed its countdown.",
+                    "protocol": {
+                      "initial_state": "IDLE",
+                      "initial_signal": "no",
+                      "description": "Sends the phase name exactly after the requested duration has elapsed, then transitions the model back to IDLE."
+                    }
+                  }
+                ]
+              }
+            },
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  "flat_registry_view": {
+    "PalletFacility": {
+      "class_name": "PalletFacility",
+      "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/PalletFacility.py",
+      "logic_path": "StrategicAirlift_D0.PalletFacility",
+      "specification": {
+        "function": "The model generates a cargo pallet every 'pallet_interval' seconds. Upon initialization, it schedules the first generation at t=0. During each generation cycle, it assigns a unique incrementing 'pallet_id', calculates an absolute 'expiration_time' (current time + pallet_expiration_time), and records the 'generation_time'. The model operates in a continuous cycle: it prepares the pallet data, outputs it via the 'pallet_out' port, logs the generation event, and then schedules the next internal transition based on the 'pallet_interval'.",
+        "logging": "pallet_generated: Triggered when a new pallet is created. log_type: 'PROCESS'. Structure: { 'time': float, 'entity': 'facility', 'event': 'pallet_generated', 'payload': { 'pallet_id': int, 'expiration_time': float } }. Additional logs include 'Model Created', 'Model Initialized' (log_type: 'PROCESS'), and 'Simulation Finished' (log_type: 'RESULT').",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "The unique identifier for the model instance."
+          },
+          {
+            "name": "parent",
+            "type": "Coupled | None",
+            "structure": "The parent coupled model instance or None if it is the root."
+          },
+          {
+            "name": "pallet_interval",
+            "type": "float",
+            "structure": "A positive float representing the time duration between the generation of consecutive pallets."
+          },
+          {
+            "name": "pallet_expiration_time",
+            "type": "float",
+            "structure": "A relative duration (float) added to the current simulation time to determine the pallet's absolute expiration deadline."
+          }
+        ],
+        "input_ports": [],
+        "output_ports": [
+          {
+            "name": "pallet_out",
+            "type": "dict",
+            "structure": "A dictionary containing: 'pallet_id' (int), 'expiration_time' (float - absolute simulation time), and 'generation_time' (float - absolute simulation time).",
+            "protocol": {
+              "initial_state": "IDLE",
+              "initial_signal": "no",
+              "description": "Initializes at t=0 to the GENERATING phase. Every 'pallet_interval', it sends a dictionary representing the pallet to the connected model (e.g., PalletQueue)."
+            }
+          }
+        ]
+      }
+    },
+    "FlightTimer": {
+      "class_name": "FlightTimer",
+      "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft_libs/FlightTimer.py",
+      "logic_path": "StrategicAirlift_D0.Aircraft.FlightTimer",
+      "specification": {
+        "function": "The FlightTimer model acts as a countdown mechanism for flight and ground operations. It receives a duration and a phase label from the MissionController. Upon receiving a 'start_timer' request, it transitions from IDLE to BUSY and schedules an internal timeout based on the provided duration. Once the duration elapses, it outputs the phase label through the 'timeout' port to notify the system that the operation is complete, then returns to the IDLE state.",
+        "logging": "The model logs lifecycle events. Specifically, it logs 'Model Created' with initialization parameters, 'Model Initialized', and 'Model Exited' upon simulation end. Log type is 'PROCESS' and the message structure includes 'event', 'params' (during creation), and 'time'.",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "The unique identifier for the model instance."
+          },
+          {
+            "name": "parent",
+            "type": "Coupled | None",
+            "structure": "Reference to the parent coupled model or None if it is the root."
+          },
+          {
+            "name": "flight_time",
+            "type": "float",
+            "structure": "Duration of outbound flight in simulation time units."
+          },
+          {
+            "name": "unload_time",
+            "type": "float",
+            "structure": "Duration of unloading operations in simulation time units."
+          },
+          {
+            "name": "return_time",
+            "type": "float",
+            "structure": "Duration of return flight in simulation time units."
+          },
+          {
+            "name": "maintenance_time",
+            "type": "float",
+            "structure": "Duration of maintenance operations in simulation time units."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "start_timer",
+            "type": "dict",
+            "structure": "A dictionary containing: 'phase' (str) - the name of the flight phase (e.g., 'flying', 'unloading'); 'duration' (float) - the time duration to wait.",
+            "protocol": {
+              "initial_state": "IDLE",
+              "initial_signal": "no",
+              "description": "Starts a countdown based on the duration provided in the message. The model transitions to BUSY state."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "timeout",
+            "type": "str",
+            "structure": "The name of the phase (str) that has just completed its countdown.",
+            "protocol": {
+              "initial_state": "IDLE",
+              "initial_signal": "no",
+              "description": "Sends the phase name exactly after the requested duration has elapsed, then transitions the model back to IDLE."
+            }
+          }
+        ]
+      }
+    },
+    "MissionController": {
+      "class_name": "MissionController",
+      "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft_libs/MissionController.py",
+      "logic_path": "StrategicAirlift_D0.Aircraft.MissionController",
+      "specification": {
+        "function": "Manages the operational cycle of an aircraft through states: IDLE, LOADING, FLYING, UNLOADING, RETURNING, and MAINTENANCE. It starts by sending a 'ready_out' signal at T=0. Upon receiving a pallet assignment, it transitions through LOADING (instantaneous), triggers a 'depart' event, and initiates a sequence of timed phases (flight, unload, return, maintenance) using an external timer. It logs key operational events like departure, delivery (with latency calculation), return, and maintenance periods. After maintenance, it signals availability again via 'ready_out'.",
+        "logging": "log_type: PROCESS. Events logged: 1. depart: {time, entity: 'aircraft', payload: {aircraft_id, pallet_id}}; 2. pallet_delivered: {time, entity: 'destination', payload: {pallet_id, aircraft_id, latency}}; 3. return: {time, entity: 'aircraft', payload: {aircraft_id}}; 4. maintenance_start: {time, entity: 'aircraft', payload: {aircraft_id}}; 5. maintenance_end: {time, entity: 'aircraft', payload: {aircraft_id}}.",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "Unique string identifier for the model instance."
+          },
+          {
+            "name": "parent",
+            "type": "Coupled | None",
+            "structure": "Reference to the parent coupled model."
+          },
+          {
+            "name": "aircraft_id",
+            "type": "int",
+            "structure": "Unique integer ID assigned to the aircraft."
+          },
+          {
+            "name": "flight_time",
+            "type": "float",
+            "structure": "Duration (in time units) for the FLYING phase."
+          },
+          {
+            "name": "unload_time",
+            "type": "float",
+            "structure": "Duration (in time units) for the UNLOADING phase."
+          },
+          {
+            "name": "return_time",
+            "type": "float",
+            "structure": "Duration (in time units) for the RETURNING phase."
+          },
+          {
+            "name": "maintenance_time",
+            "type": "float",
+            "structure": "Duration (in time units) for the MAINTENANCE phase."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "assignment_in",
+            "type": "dict",
+            "structure": "Expected keys: 'pallet_id' (int), 'expiration_time' (float), 'generation_time' (float).",
+            "protocol": {
+              "initial_state": "idle",
+              "initial_signal": "no",
+              "description": "Receives pallet data from Coordinator; triggers immediate transition to LOADING phase."
+            }
+          },
+          {
+            "name": "timer_done",
+            "type": "str",
+            "structure": "A string identifying the completed phase: 'flight', 'unload', 'return', or 'maintenance'.",
+            "protocol": {
+              "initial_state": "waiting",
+              "initial_signal": "no",
+              "description": "Signal from external FlightTimer indicating a timed phase has finished."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "start_timer",
+            "type": "dict",
+            "structure": "Contains 'phase' (str) and 'duration' (float).",
+            "protocol": {
+              "initial_state": "idle",
+              "initial_signal": "no",
+              "description": "Commands the FlightTimer to start a countdown for a specific operational phase."
+            }
+          },
+          {
+            "name": "ready_out",
+            "type": "str",
+            "structure": "The string representation of the aircraft_id.",
+            "protocol": {
+              "initial_state": "sending",
+              "initial_signal": "Sends aircraft_id at T=0",
+              "description": "Signals availability to the system at initialization and after completing maintenance."
+            }
+          }
+        ]
+      }
+    },
+    "PalletQueue": {
+      "class_name": "PalletQueue",
+      "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/PalletQueue.py",
+      "logic_path": "StrategicAirlift_D0.PalletQueue",
+      "specification": {
+        "function": "Maintains a FIFO queue of pallets. It monitors the head of the queue for expiration; if the current simulation time reaches a pallet's expiration_time, the pallet is removed and a 'pallet_expired' event is logged. It responds to 'request_pallet' signals from a Coordinator: if the queue is not empty, it pops the head pallet and sends it via 'pallet_out'. After any change in the queue (arrival, expiration, or removal), it outputs the current size via 'queue_status'.",
+        "logging": "pallet_queued: Triggered when a pallet enters the queue. payload includes pallet_id (int) and queue_size (int). pallet_expired: Triggered when a pallet's deadline is reached. payload includes pallet_id (int) and total_expired (int). log_type is 'PROCESS'.",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "Unique name of the model instance."
+          },
+          {
+            "name": "parent",
+            "type": "Coupled | None",
+            "structure": "The parent coupled model instance."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "pallet_in",
+            "type": "dict",
+            "structure": "A dictionary containing: pallet_id (int), expiration_time (float), and generation_time (float).",
+            "protocol": {
+              "initial_state": "empty",
+              "initial_signal": "no",
+              "description": "Receives pallets from PalletFacility and adds them to the FIFO queue."
+            }
+          },
+          {
+            "name": "request_pallet",
+            "type": "bool",
+            "structure": "Boolean flag indicating a request for a pallet.",
+            "protocol": {
+              "initial_state": "waiting",
+              "initial_signal": "no",
+              "description": "Trigger from Coordinator to release a pallet. If queue is not empty, pops the head."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "pallet_out",
+            "type": "dict",
+            "structure": "A dictionary containing: pallet_id (int), expiration_time (float), and generation_time (float).",
+            "protocol": {
+              "initial_state": "idle",
+              "initial_signal": "no",
+              "description": "Sends the popped pallet data to the Coordinator."
+            }
+          },
+          {
+            "name": "queue_status",
+            "type": "int",
+            "structure": "Integer representing the current number of pallets in the queue.",
+            "protocol": {
+              "initial_state": "0",
+              "initial_signal": "no",
+              "description": "Sends the current queue size after any change (arrival, expiration, or removal)."
+            }
+          }
+        ]
+      }
+    },
+    "FleetCoordinator": {
+      "class_name": "FleetCoordinator",
+      "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/FleetCoordinator.py",
+      "logic_path": "StrategicAirlift_D0.FleetCoordinator",
+      "specification": {
+        "function": "The FleetCoordinator tracks aircraft states (IDLE or BUSY) and monitors a loading queue. Its logic follows an assignment rule: if the Queue size > 0 and at least one aircraft is IDLE, it transitions to REQUESTING and sends a 'queue_request' signal. Upon receiving pallet data on 'pallet_in', it selects the first available IDLE aircraft (FIFO), transitions to ASSIGNING, and forwards the pallet data to the specific 'assign_to_aircraft_{i}' port. It then marks that aircraft as BUSY. When an aircraft finishes maintenance, it receives a signal on 'aircraft_ready_{i}' to mark that aircraft as IDLE again.",
+        "logging": "assignment_created: Triggered when a pallet is dispatched to an aircraft. log_type: 'PROCESS'. Structure: {'time': float, 'entity': 'coordinator', 'event': 'assignment_created', 'payload': {'aircraft_id': int, 'pallet_id': int}}",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "The unique name of the model instance."
+          },
+          {
+            "name": "parent",
+            "type": "Coupled | None",
+            "structure": "The parent coupled model instance."
+          },
+          {
+            "name": "num_aircraft",
+            "type": "int",
+            "structure": "Total number of aircraft to track. This determines the number of dynamic ports created (1 to num_aircraft)."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "queue_size_in",
+            "type": "int",
+            "structure": "Integer representing the current number of pallets in the external queue.",
+            "protocol": {
+              "initial_state": "0",
+              "initial_signal": "no",
+              "description": "Updates the internal current_queue_size state variable."
+            }
+          },
+          {
+            "name": "pallet_in",
+            "type": "dict",
+            "structure": "Pallet info dictionary containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float).",
+            "protocol": {
+              "initial_state": "waiting",
+              "initial_signal": "no",
+              "description": "Receives the pallet released by the queue after a request."
+            }
+          },
+          {
+            "name": "aircraft_ready_{i}",
+            "type": "str",
+            "structure": "The aircraft_id of the aircraft that just finished maintenance. Port index {i} ranges from 1 to num_aircraft.",
+            "protocol": {
+              "initial_state": "all_ready",
+              "initial_signal": "no",
+              "description": "Marks the specific aircraft index as IDLE in the internal state."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "queue_request",
+            "type": "bool",
+            "structure": "Boolean trigger (True).",
+            "protocol": {
+              "initial_state": "idle",
+              "initial_signal": "no",
+              "description": "Sends True to the queue to request a pallet release."
+            }
+          },
+          {
+            "name": "assign_to_aircraft_{i}",
+            "type": "dict",
+            "structure": "Pallet info dictionary containing: 'pallet_id' (int), 'expiration_time' (float), and 'generation_time' (float). Port index {i} ranges from 1 to num_aircraft.",
+            "protocol": {
+              "initial_state": "idle",
+              "initial_signal": "no",
+              "description": "Forwards pallet data to the specific aircraft identified as available."
+            }
+          }
+        ]
+      }
+    },
+    "Aircraft": {
+      "class_name": "Aircraft",
+      "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0_libs/Aircraft.py",
+      "logic_path": "StrategicAirlift_D0.Aircraft",
+      "specification": {
+        "function": "Represents a single aircraft entity in the logistics system. It manages the full flight cycle including Loading, Flying, Unloading, Returning, and Maintenance by coordinating between its sub-models. Sub-models: 1. MissionController (instance name: 'controller'): Manages operational states and business logic. 2. FlightTimer (instance name: 'timer'): Handles timed durations for flight phases. The model couples external assignments to the controller, internal timer commands between the controller and timer, and signals availability (ready_out) from the controller to the external system.",
+        "logging": "log_type: PROCESS. Event: 'Model Created'. Message structure: { 'event': 'Model Created', 'aircraft_id': int, 'flight_time': float, 'unload_time': float, 'return_time': float, 'maintenance_time': float }.",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "The unique name of the model instance."
+          },
+          {
+            "name": "parent",
+            "type": "Coupled | None",
+            "structure": "The parent coupled model reference."
+          },
+          {
+            "name": "aircraft_id",
+            "type": "int",
+            "structure": "Unique integer ID assigned to the aircraft."
+          },
+          {
+            "name": "flight_time",
+            "type": "float",
+            "structure": "Duration for the FLYING phase in simulation time units."
+          },
+          {
+            "name": "unload_time",
+            "type": "float",
+            "structure": "Duration for the UNLOADING phase in simulation time units."
+          },
+          {
+            "name": "return_time",
+            "type": "float",
+            "structure": "Duration for the RETURNING phase in simulation time units."
+          },
+          {
+            "name": "maintenance_time",
+            "type": "float",
+            "structure": "Duration for the MAINTENANCE phase in simulation time units."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "assignment_in",
+            "type": "dict",
+            "structure": "Expected keys: 'pallet_id' (int), 'expiration_time' (float), 'generation_time' (float).",
+            "protocol": {
+              "initial_state": "idle",
+              "initial_signal": "no",
+              "description": "Receives pallet info from the Coordinator and triggers the loading/flight cycle."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "ready_out",
+            "type": "str",
+            "structure": "The string representation of the aircraft_id.",
+            "protocol": {
+              "initial_state": "sending",
+              "initial_signal": "Sends aircraft_id at T=0",
+              "description": "Signals aircraft availability to the Coordinator at initialization and after maintenance completion."
+            }
+          }
+        ]
+      }
+    },
+    "StrategicAirlift_D0": {
+      "class_name": "StrategicAirlift_D0",
+      "file_path": "strategic_airlift/devs_project/StrategicAirlift_D0.py",
+      "logic_path": "StrategicAirlift_D0",
+      "specification": {
+        "function": "Simulates an airfreight logistics system including cargo generation, queuing, coordination, and aircraft delivery cycles. It manages the end-to-end flow from pallet creation at a facility to delivery at a destination. Sub-models: 1. PalletFacility (instance: 'facility'): Generates pallets at regular intervals. 2. PalletQueue (instance: 'queue'): Manages FIFO storage and active expiration of pallets. 3. FleetCoordinator (instance: 'coordinator'): Matches available aircraft with queued pallets. 4. Aircraft (instances: 'aircraft_{i}'): Represents individual transport units (1 to num_aircraft). The model couples these components to allow pallets to flow from the facility to the queue, and then to specific aircraft as assigned by the coordinator.",
+        "logging": "event: Model Created. log_type: PROCESS. msg (dict): Configuration parameters of the system including num_aircraft (int), pallet_interval (float), pallet_expiration_time (float), flight_time (float), unload_time (float), return_time (float), and maintenance_time (float).",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "The unique name of the model instance."
+          },
+          {
+            "name": "parent",
+            "type": "Coupled | None",
+            "structure": "The parent model (None for root)."
+          },
+          {
+            "name": "num_aircraft",
+            "type": "int",
+            "structure": "Total number of aircraft to simulate; determines the number of Aircraft sub-model instances."
+          },
+          {
+            "name": "pallet_interval",
+            "type": "float",
+            "structure": "Seconds between pallet generations in the PalletFacility."
+          },
+          {
+            "name": "pallet_expiration_time",
+            "type": "float",
+            "structure": "Seconds until a pallet expires in the PalletQueue."
+          },
+          {
+            "name": "flight_time",
+            "type": "float",
+            "structure": "Seconds for the flying phase of the Aircraft."
+          },
+          {
+            "name": "unload_time",
+            "type": "float",
+            "structure": "Seconds for the unloading phase of the Aircraft."
+          },
+          {
+            "name": "return_time",
+            "type": "float",
+            "structure": "Seconds for the returning phase of the Aircraft."
+          },
+          {
+            "name": "maintenance_time",
+            "type": "float",
+            "structure": "Seconds for the maintenance phase of the Aircraft."
+          }
+        ],
+        "input_ports": [],
+        "output_ports": []
+      }
+    }
+  },
+  "stage_report": "{\"class_name\":\"StrategicAirlift_D0\",\"file_path\":\"strategic_airlift/devs_project/StrategicAirlift_D0.py\",\"logic_path\":\"StrategicAirlift_D0\",\"specification\":{\"function\":\"Simulates an airfreight logistics system including cargo generation, queuing, coordination, and aircraft delivery cycles. It manages the end-to-end flow from pallet creation at a facility to delivery at a destination. Sub-models: 1. PalletFacility (instance: 'facility'): Generates pallets at regular intervals. 2. PalletQueue (instance: 'queue'): Manages FIFO storage and active expiration of pallets. 3. FleetCoordinator (instance: 'coordinator'): Matches available aircraft with queued pallets. 4. Aircraft (instances: 'aircraft_{i}'): Represents individual transport units (1 to num_aircraft). The model couples these components to allow pallets to flow from the facility to the queue, and then to specific aircraft as assigned by the coordinator.\",\"logging\":\"event: Model Created. log_type: PROCESS. msg (dict): Configuration parameters of the system including num_aircraft (int), pallet_interval (float), pallet_expiration_time (float), flight_time (float), unload_time (float), return_time (float), and maintenance_time (float).\",\"model_init_args\":[{\"name\":\"name\",\"type\":\"str\",\"structure\":\"The unique name of the model instance.\"},{\"name\":\"parent\",\"type\":\"Coupled | None\",\"structure\":\"The parent model (None for root).\"},{\"name\":\"num_aircraft\",\"type\":\"int\",\"structure\":\"Total number of aircraft to simulate; determines the number of Aircraft sub-model instances.\"},{\"name\":\"pallet_interval\",\"type\":\"float\",\"structure\":\"Seconds between pallet generations in the PalletFacility.\"},{\"name\":\"pallet_expiration_time\",\"type\":\"float\",\"structure\":\"Seconds until a pallet expires in the PalletQueue.\"},{\"name\":\"flight_time\",\"type\":\"float\",\"structure\":\"Seconds for the flying phase of the Aircraft.\"},{\"name\":\"unload_time\",\"type\":\"float\",\"structure\":\"Seconds for the unloading phase of the Aircraft.\"},{\"name\":\"return_time\",\"type\":\"float\",\"structure\":\"Seconds for the returning phase of the Aircraft.\"},{\"name\":\"maintenance_time\",\"type\":\"float\",\"structure\":\"Seconds for the maintenance phase of the Aircraft.\"}],\"input_ports\":[],\"output_ports\":[]}}"
+}

@@ -1,0 +1,406 @@
+{
+  "type": "coupled",
+  "model_info": {
+    "class_name": "ServiceOrchestrator",
+    "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/ServiceOrchestrator.py",
+    "logic_path": "OTrain.StationServiceSystem.ServiceOrchestrator",
+    "specification": {
+      "function": "Orchestrate station servicing on each train arrival: enforce the strict serial per-passenger timing relative to the train arrival time for both alighting and boarding, and emit the required JSONL logs.\n\nDelegated from StationServiceSystem:\n- On receiving train_arrival_in at time t for station k (direction included but used only for logging consistency):\n  1) Alighting phase (from train_load to outside):\n     - Obtain exiting_list length for station k from [Sibling-TrainLoadStore].\n     - For j=1..len(exiting_list): schedule an exit at time t + service_time_seconds * j.\n     - At each scheduled exit time, request the next passenger from [Sibling-TrainLoadStore] (FIFO removal) and emit passenger_exiting log with entity_type=\"train_queue\" and station_id=k.\n  2) Boarding phase (from StationQueueSystem queue[k] to train_load):\n     - For m=1..len(boarding_queue) evaluated dynamically as passengers are removed:\n       - Schedule boarding at time t + service_time_seconds * m (first boards at t+service_time_seconds).\n       - At each scheduled boarding time, issue dequeue_request_out to StationQueueSystem for station k.\n       - Upon receiving dequeue_response_in:\n         - If has_passenger=true: append passenger to [Sibling-TrainLoadStore] (by destination FIFO) and emit passenger_boarding log with entity_type=\"station_queue\" and station_id=k.\n         - If has_passenger=false: stop further boarding attempts for this arrival/station.\n- Timing rule fidelity:\n  - Both phases are triggered by the same train_arrival.\n  - Ensure each passenger event time respects its phase’s rule (t + service_time_seconds*j for exiting, t + service_time_seconds*m for boarding).\n  - If timestamps collide, ordering may be deterministic; implement deterministic ordering as: process all exiting actions/logs before boarding actions/logs at the same timestamp.\n\nThis child does NOT own train_load storage itself (delegated to TrainLoadStore).",
+      "logging": "Write JSONL event objects (one per line) to the provided logger. No other stdout/stderr printing.\n\nFor every passenger_exiting event emitted by this child, log exactly these top-level keys:\n- time: float\n- event: str  # always \"passenger_exiting\"\n- entity_type: str  # always \"train_queue\"\n- station_id: int  # 1..5\n- station: str  # mapping {1:\"Bayview\",2:\"Carling\",3:\"Carleton\",4:\"Confed\",5:\"Greenboro\"}\n- payload: dict with keys:\n  - 'passenger_id': int\n  - 'passenger_num': int\n  - 'origin': int\n  - 'destination': int\n\nFor every passenger_boarding event emitted by this child, log exactly these top-level keys:\n- time: float\n- event: str  # always \"passenger_boarding\"\n- entity_type: str  # always \"station_queue\"\n- station_id: int  # 1..5\n- station: str  # mapping {1:\"Bayview\",2:\"Carling\",3:\"Carleton\",4:\"Confed\",5:\"Greenboro\"}\n- payload: dict with keys:\n  - 'passenger_id': int\n  - 'passenger_num': int\n  - 'origin': int\n  - 'destination': int",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model instance name."
+        },
+        {
+          "name": "service_time_seconds",
+          "type": "float",
+          "structure": "Per-passenger boarding/alighting time. Default 0.025."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "train_arrival_in",
+          "type": "dict",
+          "structure": "Train arrival notification. Keys: 'station_id' (int, 1..5), 'direction' (int, 0 or 1).",
+          "protocol": {
+            "initial_state": "Ready to process arrivals at T=0; no pending service schedules.",
+            "initial_signal": "No initial signal (arrivals come from [Sibling-TrainMovementSystem: train_arrival_out] via parent EIC).",
+            "description": "Receives arrivals (station_id k, direction) from [Parent EIC: train_arrival_in] which is coupled to [Sibling-TrainMovementSystem: train_arrival_out]. Each arrival triggers alighting then boarding orchestration for that station."
+          }
+        },
+        {
+          "name": "dequeue_response_in",
+          "type": "dict",
+          "structure": "Response from station queue system. Keys: 'station_id' (int, 1..5), 'has_passenger' (bool), 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int),'destination'(int)) or {} if none).",
+          "protocol": {
+            "initial_state": "No pending dequeue responses at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Receives dequeue results from [Parent EIC: dequeue_response_in] which is coupled to [Sibling-StationQueueSystem: dequeue_response_out]. Used to complete each scheduled boarding step for the corresponding station."
+          }
+        },
+        {
+          "name": "alight_count_in",
+          "type": "dict",
+          "structure": "Alighting count response. Keys: 'station_id' (int, 1..5), 'count' (int, >=0).",
+          "protocol": {
+            "initial_state": "No pending alight counts at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Receives from [Sibling-TrainLoadStore: alight_count_out] the number of passengers currently in train_load[station_id] for the arrival being processed."
+          }
+        },
+        {
+          "name": "exiting_passenger_in",
+          "type": "dict",
+          "structure": "Next exiting passenger popped from train_load. Keys: 'station_id' (int, 1..5), 'has_passenger' (bool), 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int),'destination'(int)) or {} if none).",
+          "protocol": {
+            "initial_state": "No pending exiting passenger messages at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Receives from [Sibling-TrainLoadStore: exiting_passenger_out] the passenger removed from train_load[station_id] to be logged as passenger_exiting at the scheduled exit time."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "dequeue_request_out",
+          "type": "dict",
+          "structure": "Request to dequeue one passenger for boarding. Keys: 'station_id' (int, 1..5).",
+          "protocol": {
+            "initial_state": "No outstanding requests at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Sends dequeue requests to [Parent EOC: dequeue_request_out] which is coupled to [Sibling-StationQueueSystem: dequeue_request_in] as part of boarding handling after a train_arrival. Requests are issued in the order needed to realize serial boarding timing relative to the arrival time."
+          }
+        },
+        {
+          "name": "alight_start_out",
+          "type": "dict",
+          "structure": "Alighting start command. Keys: 'station_id' (int, 1..5), 'arrival_time' (float).",
+          "protocol": {
+            "initial_state": "No alighting in progress at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Sends to [Sibling-TrainLoadStore: alight_start_in] when a train_arrival is received, to initiate alighting count/snapshot for station_id."
+          }
+        },
+        {
+          "name": "pop_exiting_out",
+          "type": "dict",
+          "structure": "Command to pop the next exiting passenger for station k. Keys: 'station_id' (int, 1..5).",
+          "protocol": {
+            "initial_state": "No pending pop commands at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Sends to [Sibling-TrainLoadStore: pop_exiting_in] at each scheduled exit time to remove the next passenger from train_load[station_id] FIFO."
+          }
+        },
+        {
+          "name": "boarded_passenger_out",
+          "type": "dict",
+          "structure": "Command to append a boarded passenger into train_load by destination. Keys: 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int,1..5),'destination'(int,1..5,!=origin)).",
+          "protocol": {
+            "initial_state": "No boarded passengers to forward at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "Sends to [Sibling-TrainLoadStore: append_boarded_in] after a successful dequeue_response_in (has_passenger=true) to append passenger into train_load[passenger.destination] FIFO."
+          }
+        }
+      ]
+    }
+  },
+  "children_plan": [
+    {
+      "class_name": "ArrivalPhaseCoordinator",
+      "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/ServiceOrchestrator_libs/ArrivalPhaseCoordinator",
+      "logic_path": "OTrain.StationServiceSystem.ServiceOrchestrator.ArrivalPhaseCoordinator",
+      "specification": {
+        "function": "Coordinate per-arrival servicing workflow and enforce deterministic phase ordering across alighting vs boarding for the same train_arrival.\n\nDelegated from ServiceOrchestrator:\n- On receiving train_arrival_in at time t for station k (direction included but used only for logging consistency):\n  - Initiate alighting by sending alight_start_out to TrainLoadStore with {'station_id':k,'arrival_time':t}.\n  - Ensure deterministic ordering rule at identical timestamps: all alighting actions/logs must be processed before any boarding actions/logs for the same arrival when times collide.\n  - Provide the arrival context (t, station_id k, direction) to the alighting and boarding schedulers so they can schedule events at t + service_time_seconds * j (alight) and t + service_time_seconds * m (board).\n\nThis child does NOT itself pop passengers, does NOT issue dequeue requests, and does NOT write passenger_exiting/passenger_boarding logs; it only coordinates start/context and ordering constraints between sibling schedulers.",
+        "logging": "No JSONL passenger_exiting/passenger_boarding logs are emitted by this child. If internal debug logging is needed, use the provided Logger but do not print to stdout/stderr. Do not emit events with keys {time,event,entity_type,station_id,station,payload} from this child.",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "Unique model instance name."
+          },
+          {
+            "name": "service_time_seconds",
+            "type": "float",
+            "structure": "Per-passenger boarding/alighting time. Default 0.025."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "train_arrival_in",
+            "type": "dict",
+            "structure": "Train arrival notification. Keys: 'station_id' (int, 1..5), 'direction' (int, 0 or 1).",
+            "protocol": {
+              "initial_state": "Ready to process arrivals at T=0; no pending service schedules.",
+              "initial_signal": "No initial signal (arrivals come from [Parent EIC: train_arrival_in]).",
+              "description": "Receives arrivals from [Parent EIC: train_arrival_in]. For each arrival, forwards start/context to [Sibling-AlightingScheduler: arrival_ctx_in] and [Sibling-BoardingScheduler: arrival_ctx_in], and sends alight_start_out to [Parent EOC: alight_start_out] (wired to TrainLoadStore). Enforces deterministic ordering by signaling [Sibling-BoardingScheduler: alight_done_in] only after alighting for this arrival is complete."
+            }
+          },
+          {
+            "name": "alight_complete_in",
+            "type": "dict",
+            "structure": "Alighting completion notification. Keys: 'station_id' (int, 1..5), 'arrival_time' (float).",
+            "protocol": {
+              "initial_state": "No completion notifications pending at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Receives completion from [Sibling-AlightingScheduler: alight_complete_out] indicating all scheduled alighting actions for that (station_id, arrival_time) have been executed. Used to release boarding for the same arrival to satisfy 'exiting before boarding at same timestamp' rule."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "alight_start_out",
+            "type": "dict",
+            "structure": "Alighting start command. Keys: 'station_id' (int, 1..5), 'arrival_time' (float).",
+            "protocol": {
+              "initial_state": "No alighting in progress at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Sends to [Parent EOC: alight_start_out], coupled to [Sibling-TrainLoadStore: alight_start_in], immediately upon each train_arrival_in to initiate alighting count/snapshot."
+            }
+          },
+          {
+            "name": "alight_start_ctx_out",
+            "type": "dict",
+            "structure": "Arrival context broadcast to start alighting scheduling. Keys: 'station_id' (int, 1..5), 'arrival_time' (float), 'direction' (int, 0 or 1).",
+            "protocol": {
+              "initial_state": "No active arrival contexts at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Sends to [Sibling-AlightingScheduler: arrival_ctx_in] for each train_arrival_in to allow scheduling exits at t + service_time_seconds*j and to preserve direction for logging consistency downstream."
+            }
+          },
+          {
+            "name": "board_start_ctx_out",
+            "type": "dict",
+            "structure": "Arrival context broadcast to start boarding scheduling. Keys: 'station_id' (int, 1..5), 'arrival_time' (float), 'direction' (int, 0 or 1).",
+            "protocol": {
+              "initial_state": "No active arrival contexts at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Sends to [Sibling-BoardingScheduler: arrival_ctx_in] for each train_arrival_in. BoardingScheduler must not execute boarding actions for this arrival until it also receives alight_done_out for the same (station_id, arrival_time) to enforce deterministic ordering when timestamps collide."
+            }
+          },
+          {
+            "name": "alight_done_out",
+            "type": "dict",
+            "structure": "Gate signal indicating alighting is complete for an arrival. Keys: 'station_id' (int, 1..5), 'arrival_time' (float).",
+            "protocol": {
+              "initial_state": "No gates released at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Sends to [Sibling-BoardingScheduler: alight_done_in] after receiving [Sibling-AlightingScheduler: alight_complete_out] for the same arrival. This prevents cold-start deadlock because boarding can still be scheduled but must wait for this explicit release."
+            }
+          }
+        ]
+      }
+    },
+    {
+      "class_name": "AlightingScheduler",
+      "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/ServiceOrchestrator_libs/AlightingScheduler",
+      "logic_path": "OTrain.StationServiceSystem.ServiceOrchestrator.AlightingScheduler",
+      "specification": {
+        "function": "Implement the alighting phase timing and interactions with TrainLoadStore for each train arrival.\n\nDelegated from ServiceOrchestrator:\n- For each arrival context (station k, arrival time t):\n  - Obtain exiting_list length for station k by relying on the alight_count_in response from TrainLoadStore (triggered by alight_start_out sent by ArrivalPhaseCoordinator).\n  - For j=1..count: schedule an exit action at time t + service_time_seconds * j.\n  - At each scheduled exit time:\n    - Send pop_exiting_out {'station_id':k} to TrainLoadStore to remove next passenger FIFO.\n    - Upon receiving exiting_passenger_in with has_passenger=true, forward the passenger and log-intent metadata to the PassengerEventLogger so it can emit passenger_exiting JSONL with entity_type=\"train_queue\" and station_id=k at that scheduled time.\n\n- When all scheduled exits for that arrival are completed (i.e., after j=count has been processed), emit alight_complete_out so boarding can be deterministically released.\n\nThis child does NOT mutate train_load directly (TrainLoadStore does), does NOT issue station queue dequeues, and does NOT itself write JSONL logs (delegated to PassengerEventLogger).",
+        "logging": "No direct JSONL passenger_exiting logs are emitted by this child. If internal debug logging is needed, use the provided Logger without stdout/stderr. Do not emit events with keys {time,event,entity_type,station_id,station,payload} from this child.",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "Unique model instance name."
+          },
+          {
+            "name": "service_time_seconds",
+            "type": "float",
+            "structure": "Per-passenger boarding/alighting time. Default 0.025."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "arrival_ctx_in",
+            "type": "dict",
+            "structure": "Arrival context. Keys: 'station_id' (int, 1..5), 'arrival_time' (float), 'direction' (int, 0 or 1).",
+            "protocol": {
+              "initial_state": "No active alighting schedules at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Receives from [Sibling-ArrivalPhaseCoordinator: alight_start_ctx_out] on each train arrival. Used to associate subsequent alight_count_in and exiting_passenger_in with the correct arrival_time for scheduling at t + service_time_seconds*j."
+            }
+          },
+          {
+            "name": "alight_count_in",
+            "type": "dict",
+            "structure": "Alighting count response. Keys: 'station_id' (int, 1..5), 'count' (int, >=0).",
+            "protocol": {
+              "initial_state": "No pending alight counts at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Receives from [Parent EIC: alight_count_in] (wired from TrainLoadStore: alight_count_out). Used to schedule exactly 'count' pop_exiting_out actions at times t + service_time_seconds*j for the active arrival context of that station."
+            }
+          },
+          {
+            "name": "exiting_passenger_in",
+            "type": "dict",
+            "structure": "Next exiting passenger popped from train_load. Keys: 'station_id' (int, 1..5), 'has_passenger' (bool), 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int),'destination'(int)) or {} if none).",
+            "protocol": {
+              "initial_state": "No pending exiting passenger messages at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Receives from [Parent EIC: exiting_passenger_in] (wired from TrainLoadStore: exiting_passenger_out) in response to each pop_exiting_out. When has_passenger=true, forwards to [Sibling-PassengerEventLogger: exiting_event_in] with the arrival context so the logger can emit passenger_exiting at the scheduled time."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "pop_exiting_out",
+            "type": "dict",
+            "structure": "Command to pop the next exiting passenger for station k. Keys: 'station_id' (int, 1..5).",
+            "protocol": {
+              "initial_state": "No pending pop commands at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Sends to [Parent EOC: pop_exiting_out], coupled to [Sibling-TrainLoadStore: pop_exiting_in], at each scheduled exit time t + service_time_seconds*j for the active arrival."
+            }
+          },
+          {
+            "name": "exiting_event_out",
+            "type": "dict",
+            "structure": "Internal event for logging an exiting passenger. Keys: 'time' (float), 'station_id' (int, 1..5), 'direction' (int, 0 or 1), 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int),'destination'(int)).",
+            "protocol": {
+              "initial_state": "No pending exiting log events at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Sends to [Sibling-PassengerEventLogger: exiting_event_in] after receiving a popped passenger (has_passenger=true). 'time' must equal the scheduled exit time t + service_time_seconds*j for that passenger."
+            }
+          },
+          {
+            "name": "alight_complete_out",
+            "type": "dict",
+            "structure": "Alighting completion notification. Keys: 'station_id' (int, 1..5), 'arrival_time' (float).",
+            "protocol": {
+              "initial_state": "No completion notifications at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Sends to [Sibling-ArrivalPhaseCoordinator: alight_complete_in] once all scheduled exiting actions for the arrival (station_id, arrival_time) have been executed, enabling deterministic release of boarding."
+            }
+          }
+        ]
+      }
+    },
+    {
+      "class_name": "BoardingScheduler",
+      "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/ServiceOrchestrator_libs/BoardingScheduler",
+      "logic_path": "OTrain.StationServiceSystem.ServiceOrchestrator.BoardingScheduler",
+      "specification": {
+        "function": "Implement the boarding phase timing and interactions with StationQueueSystem and TrainLoadStore for each train arrival.\n\nDelegated from ServiceOrchestrator:\n- For each arrival context (station k, arrival time t):\n  - Schedule boarding attempts at times t + service_time_seconds * m for m=1.. until StationQueueSystem reports empty.\n  - At each scheduled boarding time:\n    - Issue dequeue_request_out {'station_id':k} to StationQueueSystem.\n    - Upon receiving dequeue_response_in for station k:\n      - If has_passenger=true: forward passenger to TrainLoadStore via boarded_passenger_out and forward a logging event to PassengerEventLogger so it can emit passenger_boarding JSONL with entity_type=\"station_queue\" and station_id=k at that scheduled time.\n      - If has_passenger=false: stop further boarding attempts for this arrival/station.\n\n- Deterministic ordering constraint (from parent): if timestamps collide, process all exiting actions/logs before boarding actions/logs at the same timestamp. Therefore, for a given arrival, this child must not execute any dequeue_request_out / boarding log event at a time that collides with alighting unless it has received alight_done_in for that arrival from ArrivalPhaseCoordinator.\n\nThis child does NOT itself write JSONL logs (delegated to PassengerEventLogger).",
+        "logging": "No direct JSONL passenger_boarding logs are emitted by this child. If internal debug logging is needed, use the provided Logger without stdout/stderr. Do not emit events with keys {time,event,entity_type,station_id,station,payload} from this child.",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "Unique model instance name."
+          },
+          {
+            "name": "service_time_seconds",
+            "type": "float",
+            "structure": "Per-passenger boarding/alighting time. Default 0.025."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "arrival_ctx_in",
+            "type": "dict",
+            "structure": "Arrival context. Keys: 'station_id' (int, 1..5), 'arrival_time' (float), 'direction' (int, 0 or 1).",
+            "protocol": {
+              "initial_state": "No active boarding schedules at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Receives from [Sibling-ArrivalPhaseCoordinator: board_start_ctx_out] on each train arrival. Used to schedule boarding attempts at t + service_time_seconds*m for that station."
+            }
+          },
+          {
+            "name": "alight_done_in",
+            "type": "dict",
+            "structure": "Gate signal indicating alighting is complete for an arrival. Keys: 'station_id' (int, 1..5), 'arrival_time' (float).",
+            "protocol": {
+              "initial_state": "No gates released at T=0; boarding actions for an arrival must wait for this gate to satisfy deterministic ordering when timestamps collide.",
+              "initial_signal": "No initial signal.",
+              "description": "Receives from [Sibling-ArrivalPhaseCoordinator: alight_done_out]. BoardingScheduler must not execute dequeue_request_out / boarding log events for that (station_id, arrival_time) until this is received."
+            }
+          },
+          {
+            "name": "dequeue_response_in",
+            "type": "dict",
+            "structure": "Response from station queue system. Keys: 'station_id' (int, 1..5), 'has_passenger' (bool), 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int),'destination'(int)) or {} if none).",
+            "protocol": {
+              "initial_state": "No pending dequeue responses at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Receives from [Parent EIC: dequeue_response_in] (wired from StationQueueSystem: dequeue_response_out). Used to complete each scheduled boarding attempt. If has_passenger=false, stop further boarding attempts for that arrival/station."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "dequeue_request_out",
+            "type": "dict",
+            "structure": "Request to dequeue one passenger for boarding. Keys: 'station_id' (int, 1..5).",
+            "protocol": {
+              "initial_state": "No outstanding requests at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Sends to [Parent EOC: dequeue_request_out] (wired to StationQueueSystem: dequeue_request_in) at each scheduled boarding time t + service_time_seconds*m after alight_done_in has been received for the arrival."
+            }
+          },
+          {
+            "name": "boarded_passenger_out",
+            "type": "dict",
+            "structure": "Command to append a boarded passenger into train_load by destination. Keys: 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int,1..5),'destination'(int,1..5,!=origin)).",
+            "protocol": {
+              "initial_state": "No boarded passengers to forward at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Sends to [Parent EOC: boarded_passenger_out] (wired to TrainLoadStore: append_boarded_in) after a successful dequeue_response_in (has_passenger=true)."
+            }
+          },
+          {
+            "name": "boarding_event_out",
+            "type": "dict",
+            "structure": "Internal event for logging a boarding passenger. Keys: 'time' (float), 'station_id' (int, 1..5), 'direction' (int, 0 or 1), 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int),'destination'(int)).",
+            "protocol": {
+              "initial_state": "No pending boarding log events at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Sends to [Sibling-PassengerEventLogger: boarding_event_in] when has_passenger=true. 'time' must equal the scheduled boarding time t + service_time_seconds*m for that passenger."
+            }
+          }
+        ]
+      }
+    },
+    {
+      "class_name": "PassengerEventLogger",
+      "file_path": "otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/ServiceOrchestrator_libs/PassengerEventLogger",
+      "logic_path": "OTrain.StationServiceSystem.ServiceOrchestrator.PassengerEventLogger",
+      "specification": {
+        "function": "Emit the required JSONL logs for passenger_exiting and passenger_boarding events exactly as specified.\n\nDelegated from ServiceOrchestrator logging:\n- On receiving an exiting_event_in with (time, station_id, passenger): write one JSONL line with top-level keys exactly:\n  - time (float): provided time\n  - event (str): \"passenger_exiting\"\n  - entity_type (str): \"train_queue\"\n  - station_id (int)\n  - station (str): mapping {1:\"Bayview\",2:\"Carling\",3:\"Carleton\",4:\"Confed\",5:\"Greenboro\"}\n  - payload (dict): passenger with keys passenger_id, passenger_num, origin, destination\n- On receiving a boarding_event_in with (time, station_id, passenger): write one JSONL line with top-level keys exactly:\n  - time (float): provided time\n  - event (str): \"passenger_boarding\"\n  - entity_type (str): \"station_queue\"\n  - station_id (int)\n  - station (str): mapping {1:\"Bayview\",2:\"Carling\",3:\"Carleton\",4:\"Confed\",5:\"Greenboro\"}\n  - payload (dict): passenger with keys passenger_id, passenger_num, origin, destination\n\nThis child does not schedule times; it trusts the provided 'time' field from schedulers. It does not interact with TrainLoadStore or StationQueueSystem.",
+        "logging": "Write JSONL event objects (one per line) to the provided logger. No other stdout/stderr printing.\n\nFor every passenger_exiting event emitted by this child, log exactly these top-level keys:\n- time: float\n- event: str  # always \"passenger_exiting\"\n- entity_type: str  # always \"train_queue\"\n- station_id: int  # 1..5\n- station: str  # mapping {1:\"Bayview\",2:\"Carling\",3:\"Carleton\",4:\"Confed\",5:\"Greenboro\"}\n- payload: dict with keys:\n  - 'passenger_id': int\n  - 'passenger_num': int\n  - 'origin': int\n  - 'destination': int\n\nFor every passenger_boarding event emitted by this child, log exactly these top-level keys:\n- time: float\n- event: str  # always \"passenger_boarding\"\n- entity_type: str  # always \"station_queue\"\n- station_id: int  # 1..5\n- station: str  # mapping {1:\"Bayview\",2:\"Carling\",3:\"Carleton\",4:\"Confed\",5:\"Greenboro\"}\n- payload: dict with keys:\n  - 'passenger_id': int\n  - 'passenger_num': int\n  - 'origin': int\n  - 'destination': int",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "Unique model instance name."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "exiting_event_in",
+            "type": "dict",
+            "structure": "Internal exiting log event. Keys: 'time' (float), 'station_id' (int, 1..5), 'direction' (int, 0 or 1), 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int),'destination'(int)).",
+            "protocol": {
+              "initial_state": "Ready to log at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Receives from [Sibling-AlightingScheduler: exiting_event_out]. Uses station_id to compute station name mapping and writes the JSONL passenger_exiting event. 'direction' is received for logging consistency context but is not included in the JSONL per spec."
+            }
+          },
+          {
+            "name": "boarding_event_in",
+            "type": "dict",
+            "structure": "Internal boarding log event. Keys: 'time' (float), 'station_id' (int, 1..5), 'direction' (int, 0 or 1), 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int),'destination'(int)).",
+            "protocol": {
+              "initial_state": "Ready to log at T=0.",
+              "initial_signal": "No initial signal.",
+              "description": "Receives from [Sibling-BoardingScheduler: boarding_event_out]. Uses station_id to compute station name mapping and writes the JSONL passenger_boarding event. 'direction' is received for logging consistency context but is not included in the JSONL per spec."
+            }
+          }
+        ],
+        "output_ports": []
+      }
+    }
+  ],
+  "coupling_specification": "Instantiate direct children:\n- ArrivalPhaseCoordinator as coord\n- AlightingScheduler as alight_sched\n- BoardingScheduler as board_sched\n- PassengerEventLogger as event_logger\n\nExternal Interface (preserve ServiceOrchestrator ports):\n- EIC: [Parent: train_arrival_in] -> [coord: train_arrival_in]\n- EIC: [Parent: alight_count_in] -> [alight_sched: alight_count_in]\n- EIC: [Parent: exiting_passenger_in] -> [alight_sched: exiting_passenger_in]\n- EIC: [Parent: dequeue_response_in] -> [board_sched: dequeue_response_in]\n- EOC: [board_sched: dequeue_request_out] -> [Parent: dequeue_request_out]\n- EOC: [coord: alight_start_out] -> [Parent: alight_start_out]\n- EOC: [alight_sched: pop_exiting_out] -> [Parent: pop_exiting_out]\n- EOC: [board_sched: boarded_passenger_out] -> [Parent: boarded_passenger_out]\n\nInternal Couplings (IC):\n- [coord: alight_start_ctx_out] -> [alight_sched: arrival_ctx_in]\n- [coord: board_start_ctx_out] -> [board_sched: arrival_ctx_in]\n- [alight_sched: alight_complete_out] -> [coord: alight_complete_in]\n- [coord: alight_done_out] -> [board_sched: alight_done_in]\n- [alight_sched: exiting_event_out] -> [event_logger: exiting_event_in]\n- [board_sched: boarding_event_out] -> [event_logger: boarding_event_in]\n\nDeadlock avoidance / initialization:\n- No closed-loop credit is required because coord is triggered by external train_arrival_in.\n- Boarding is explicitly gated by coord via alight_done_out to satisfy deterministic ordering when timestamps collide; board_sched may create schedules on arrival_ctx_in but must not emit dequeue_request_out until alight_done_in is received for that arrival.",
+  "_context_used": "logic_path='OTrain.StationServiceSystem.ServiceOrchestrator' original_project_requirements='{\\'general\\': \\'### General Implementation Requirements\\\\n1. Language & Environment:\\\\n- Target Language: Python 3.10+\\\\n- Standard Libraries: `argparse`, `sys`, `json`, `logging`, `collections`, `random`, `simpy`, `xdevs`.\\\\n\\\\n2. Input Interface (Arguments):\\\\n- **CLI Arguments:** You MUST use the `argparse` library to handle configuration parameters.\\\\n- **Data Stream:** If dynamic input is required, read from `sys.stdin` line-by-line.\\\\n\\\\n3. Output Interface:\\\\n- Stream 1: Final State (sys.stdout)\\\\n    - You MUST print ONLY JSONL objects containing the required events.\\\\n    - Schema: The objects MUST follow the structure described later. \\\\n    - Example: `print(json.dumps({...}))`\\\\n- Stream 2: Debug/Log data (sys.stderr)\\\\n    - Print any other information (debug, progress, warnings) to Standard Error.\\\\n\\\\n4. Entry point: executable via `python run.py`\\\\n\\\\nDo not use real time, use simulation time, and guarantee the simulation ends in 10 seconds in real time. \\\\n\\\\nUse system time to set the seed for random number generation (e.g. `import random, time, numpy`, `random.seed(time.time_ns())`, `numpy.random.seed(time.time_ns() % (2**32 - 1))`).\\\\n\\', \\'scenario\\': \\'### Scenario: O-Train Light Rail Simulation\\\\n\\\\n#### 1. System Overview\\\\nSimulate the Ottawa O-Train light rail system consisting of a single train shuttling passengers between 5 fixed stations. The system is event-driven and stochastic, modeling train movement, passenger generation, FIFO queuing, and serial boarding/alighting processes.\\\\n\\\\n**Station Configuration:**\\\\n* **IDs & Names:** 1=Bayview, 2=Carling, 3=Carleton, 4=Confed, 5=Greenboro.\\\\n* **Route:** Bidirectional single-track logic.\\\\n* **Directions:** 0=Southbound (Bayview→Greenboro), 1=Northbound (Greenboro→Bayview).\\\\n\\\\n#### 2. System Logic & Component Behavior\\\\n\\\\n**A. Train Operations (Scheduler)**\\\\n* **Role:** Controls the movement of the single train across the network.\\\\n* **Route Sequence:** Bayview(1, dir=0) → Carling(2, 0) → Carleton(3, 0) → Confed(4, 0) → Greenboro(5, 1) → Confed(4, 1) → Carleton(3, 1) → Carling(2, 1) → Bayview(1, 0) ... (Repeating).\\\\n* **Timing:**\\\\n    * **Initial Arrival:** t=0.0 at Bayview (Station 1, Direction 0).\\\\n    * **Travel Interval:** Exactly 225 seconds between consecutive stations.\\\\n* **Events:** Generates a `train_arrival` event at every stop.\\\\n\\\\n**B. Passenger Generation**\\\\n* **Role:** Creates passengers at each of the 5 stations.\\\\n* **Initialization:** At t=0.5 seconds, a special \"initialization passenger\" (ID=0) is generated at every station.\\\\n* **Generation Logic:**\\\\n    * Interval: Randomized using a Normal Distribution (Mean=5.0 min, Std=5.0 min).\\\\n    * Constraint: Intervals are clamped to the range [1, 9] minutes, then converted to seconds and rounded to the nearest integer seconds.\\\\n    * Destination: Uniformly selected from the other 4 stations (cannot be the same as origin).\\\\n* **Passenger Identity (Encoding):**\\\\n    * Formula: `passenger_id = passenger_num * 100 + origin * 10 + destination`\\\\n    * *Example:* ID 132 = 1st passenger, Origin 3 (Carleton), Destination 2 (Carling).\\\\n    * *Exception:* The initial passenger at t=0.5 has `passenger_id=0`.\\\\n* **Events:** Generates a `passenger_generated` event upon creation.\\\\n\\\\n**C. Station Boarding Logic (Station Queues)**\\\\n* **Role:** Manages passengers waiting at a station to board the train.\\\\n* **Queue Discipline:** Strictly FIFO (First-In-First-Out).\\\\n* **Validation:** Passengers only join the queue if their encoded origin matches the station and destination is different.\\\\n* **Boarding Process:**\\\\n    1.  Triggered by `train_arrival` at the station.\\\\n    2.  Passengers board one by one.\\\\n    3.  Delay: The first passenger boards 0.025s after train arrival. Subsequent passengers board 0.025s after the previous one (serial processing).\\\\n* **Events:** Generates a `passenger_boarding` event for each successful board.\\\\n\\\\n**D. In-Train Alighting Logic**\\\\n* **Role:** Manages passengers currently on the train and handles their exit at specific destinations.\\\\n* **Organization:** Passengers are logically grouped by their destination station.\\\\n* **Alighting Process:**\\\\n    1.  Triggered by `train_arrival` at a specific station.\\\\n    2.  Passengers destined for this station alight one by one.\\\\n    3.  **Delay:** The first passenger alights 0.025s after train arrival. Subsequent passengers alight 0.025s after the previous one.\\\\n* **Events:** Generates a `passenger_exiting` event for each passenger leaving the train.\\\\n\\', \\'args_input_output\\': \\'### Arguments & Input/Output Specifications\\\\n\\\\n#### 1. Command Line Arguments\\\\nThe script must be executable via `python run.py` and accept:\\\\n* `--simulate_time` (str): Simulation duration in \"HH:MM:SS:mmm\". Default: \"00:01:00:000\".\\\\n\\\\n#### 2. Standard Output (Stream 1)\\\\n* **Format:** JSONL (one JSON object per line).\\\\n* **Content:** Must contain the simulation events described below. More events are allowed but not encouraged. \\\\n\\\\n#### 3. Event JSON Schemas\\\\n\\\\n**Global Field Definitions (Common to All Events)**\\\\nEvery JSON event object MUST contain these top-level fields:\\\\n\\\\n| Field | Type | Description / Constraints |\\\\n| :--- | :--- | :--- |\\\\n| `time` | `float` | Simulation timestamp in seconds. Non-negative. Precision up to milliseconds. |\\\\n| `event` | `string` | The event type identifier. Must be one of: `passenger_generated`, `train_arrival`, `passenger_boarding`, `passenger_exiting`. |\\\\n| `entity_type` | `string` | The class of the object generating the event. See specific events for allowed values. |\\\\n| `station_id` | `int` | ID of the station where the event occurs. **Range: 1 to 5**. |\\\\n| `station` | `string` | Name of the station. Must match `station_id`: 1=\"Bayview\", 2=\"Carling\", 3=\"Carleton\", 4=\"Confed\", 5=\"Greenboro\". |\\\\n| `payload` | `object` | Event-specific data dictionary. |\\\\n\\\\n---\\\\n\\\\n**Event A: Passenger Generation**\\\\nTriggered when a new passenger arrives at a station.\\\\n* **`event`**: `\"passenger_generated\"`\\\\n* **`entity_type`**: `\"passenger_generator\"`\\\\n* **`payload`**:\\\\n    * `passenger_id` (int): Unique ID. Formula: `num*100 + origin*10 + dest`. Exception: Initial passengers at t=0.5 have ID `0`.\\\\n    * `passenger_num` (int): Sequential counter (0 for initial, >=1 for others).\\\\n    * `origin` (int): Station ID (1-5). Must match the top-level `station_id`.\\\\n    * `destination` (int): Station ID (1-5). **Constraint:** `destination != origin`.\\\\n\\\\n**Event B: Train Arrival**\\\\nTriggered when the train arrives at a station.\\\\n* **`event`**: `\"train_arrival\"`\\\\n* **`entity_type`**: `\"train\"`\\\\n* **`payload`**:\\\\n    * `station` (int): Station ID (1-5). Must match top-level `station_id`.\\\\n    * `direction` (int): `0` for Southbound (Bayview→Greenboro), `1` for Northbound (Greenboro→Bayview).\\\\n\\\\n**Event C: Passenger Boarding**\\\\nTriggered when a passenger moves from the station queue onto the train.\\\\n* **`event`**: `\"passenger_boarding\"`\\\\n* **`entity_type`**: `\"station_queue\"`\\\\n* **`payload`**:\\\\n    * Same schema as Passenger Generation.\\\\n\\\\n**Event D: Passenger Exiting**\\\\nTriggered when a passenger alights from the train at their destination.\\\\n* **`event`**: `\"passenger_exiting\"`\\\\n* **`entity_type`**: `\"train_queue\"`\\\\n* **`payload`**:\\\\n    * Same schema as Passenger Generation.\\\\n\\'}' ancestors=[StandardContextModel(class_name='OTrain', file_path=PosixPath('otrain_model/devs_project/OTrain.py'), logic_path='OTrain', specification=ModelSpecification(function='Time unit: 1.0 simulation time unit = 1 second.\\n\\nState & constants to maintain\\n- Stations: fixed mapping {1:\"Bayview\", 2:\"Carling\", 3:\"Carleton\", 4:\"Confed\", 5:\"Greenboro\"}.\\n- Train route is a repeating sequence of (station_id, direction):\\n  [(1,0),(2,0),(3,0),(4,0),(5,1),(4,1),(3,1),(2,1),(1,0)] then repeat from the second element onward to continue cyclically.\\n- Travel time between consecutive stations: exactly 225 seconds.\\n- Boarding/alighting service time: 0.025 seconds per passenger, strictly serial.\\n- Per-station FIFO waiting queues: queue[station_id] holds passenger records in arrival order.\\n- In-train passenger storage grouped by destination: train_load[destination_station_id] is a FIFO list of passenger records currently on the train whose destination is that station.\\n- Passenger numbering: for each station, maintain a sequential counter passenger_num[station_id].\\n  - Special initialization passengers at t=0.5 use passenger_num=0 and passenger_id=0.\\n  - Subsequent generated passengers use passenger_num starting at 1 and increment by 1 per generation at that origin station.\\n\\nPassenger record schema (used internally for queues and for event payloads)\\n- passenger := {\\n    \\'passenger_id\\': int,\\n    \\'passenger_num\\': int,\\n    \\'origin\\': int,          # 1..5\\n    \\'destination\\': int      # 1..5, != origin\\n  }\\n\\nInitialization behavior\\n- At simulation start, schedule train initial arrival:\\n  - At t=0.0, train is at station_id=1 (Bayview) with direction=0 (Southbound).\\n  - Emit a train_arrival event at t=0.0 for station 1, direction 0.\\n- At t=0.5 seconds, generate one special initialization passenger at every station (1..5):\\n  - For each origin station s in 1..5:\\n    - Choose destination uniformly at random among {1..5} \\\\ {s}.\\n    - Create passenger with passenger_id=0, passenger_num=0, origin=s, destination=chosen.\\n    - Validate before enqueue: origin must equal station s and destination != origin (always true by construction).\\n    - Enqueue passenger into queue[s] (FIFO).\\n    - Emit passenger_generated event at t=0.5 for station s.\\n\\nOngoing passenger generation (stochastic, per station, independent)\\n- For each station s in 1..5, run an independent generation process after the initialization passenger:\\n  - Repeatedly:\\n    1) Sample an inter-arrival interval in minutes from Normal(mean=5.0, std=5.0).\\n    2) Clamp sampled minutes to [1, 9].\\n    3) Convert to seconds: interval_seconds = round(clamped_minutes * 60).\\n    4) Wait interval_seconds simulation seconds.\\n    5) Increment passenger_num[s] by 1 (first non-initial passenger is 1).\\n    6) Choose destination uniformly at random among {1..5} \\\\ {s}.\\n    7) Compute passenger_id using encoding:\\n       passenger_id = passenger_num[s] * 100 + s * 10 + destination.\\n    8) Validate: passenger.origin == s and destination != s; if valid, enqueue into queue[s] (FIFO).\\n    9) Emit passenger_generated event at the current simulation time for station s.\\n\\nTrain movement and arrival scheduling\\n- The train follows the fixed route sequence forever (or until the external controller stops the simulation at simulate_time).\\n- After each train_arrival at route index i, schedule the next arrival:\\n  - next_index = (i + 1) modulo len(route_sequence)\\n  - next_time = current_arrival_time + 225.0\\n  - At next_time, the train arrives at station_id=route_sequence[next_index].station_id with direction=route_sequence[next_index].direction.\\n  - Emit train_arrival at each stop.\\n\\nTrain arrival handling (alighting then boarding; both serial)\\n- When a train_arrival occurs at time t at station k:\\n  1) Alighting phase (from train to station):\\n     - Let exiting_list = train_load[k] (all passengers whose destination is k), in FIFO order.\\n     - For j from 1..len(exiting_list):\\n       - The j-th passenger exits at time t + 0.025 * j.\\n       - Remove that passenger from train_load[k].\\n       - Emit passenger_exiting event at that exit time with entity_type=\"train_queue\" and station_id=k.\\n  2) Boarding phase (from station queue to train):\\n     - Let boarding_queue = queue[k] (FIFO).\\n     - For m from 1..len(boarding_queue) (evaluated dynamically as passengers are removed):\\n       - The m-th boarded passenger boards at time t + 0.025 * m.\\n         (Boarding delay is defined relative to train arrival; first boards 0.025s after arrival, then every 0.025s.)\\n       - Dequeue the head passenger p from queue[k].\\n       - Append p into train_load[p[\\'destination\\']] (FIFO within that destination group).\\n       - Emit passenger_boarding event at that boarding time with entity_type=\"station_queue\" and station_id=k.\\n- Note: Both alighting and boarding are triggered by the same train_arrival. This specification keeps the per-passenger timing rule exactly (0.025s after arrival and serial). If both phases are implemented, the model must ensure each passenger event time respects its phase’s rule; ordering between phases at identical timestamps may be deterministic (e.g., process all exiting events before boarding events when timestamps collide).\\n\\nEvent data constraints (must be enforced when emitting)\\n- station_id is always an int in [1,5].\\n- station name must match station_id via the fixed mapping.\\n- direction is 0 for Southbound and 1 for Northbound, and must match the route sequence.\\n- For passenger payloads: origin in [1,5], destination in [1,5], destination != origin.\\n- Passenger queue validation: only enqueue if encoded origin matches the station and destination differs (by construction for generated passengers).', logging='The core model must write JSONL event objects (one per line) to its logger; the external controller will route these logs to stdout.\\n\\nFor every emitted event, log a single JSON object with exactly these top-level keys:\\n- time: float  # simulation timestamp in seconds, non-negative, millisecond precision acceptable\\n- event: str   # one of: \"passenger_generated\", \"train_arrival\", \"passenger_boarding\", \"passenger_exiting\"\\n- entity_type: str\\n  - \"passenger_generator\" for passenger_generated\\n  - \"train\" for train_arrival\\n  - \"station_queue\" for passenger_boarding\\n  - \"train_queue\" for passenger_exiting\\n- station_id: int  # 1..5\\n- station: str     # must match station_id mapping\\n- payload: dict    # event-specific payload\\n\\nEvent-specific payload schemas to log:\\n1) passenger_generated (entity_type=\"passenger_generator\"):\\n   payload = {\\n     \\'passenger_id\\': int,\\n     \\'passenger_num\\': int,\\n     \\'origin\\': int,\\n     \\'destination\\': int\\n   }\\n2) train_arrival (entity_type=\"train\"):\\n   payload = {\\n     \\'station\\': int,      # same as station_id\\n     \\'direction\\': int     # 0 or 1\\n   }\\n3) passenger_boarding (entity_type=\"station_queue\"):\\n   payload = {\\n     \\'passenger_id\\': int,\\n     \\'passenger_num\\': int,\\n     \\'origin\\': int,\\n     \\'destination\\': int\\n   }\\n4) passenger_exiting (entity_type=\"train_queue\"):\\n   payload = {\\n     \\'passenger_id\\': int,\\n     \\'passenger_num\\': int,\\n     \\'origin\\': int,\\n     \\'destination\\': int\\n   }\\n\\nNo additional stdout/stderr printing is performed by the core model; only logger emission of these JSON objects.', model_init_args=[TypedEntity(name='travel_time_seconds', type='float', structure='Constant travel time between consecutive stations. Default 225.0.'), TypedEntity(name='service_time_seconds', type='float', structure='Per-passenger boarding/alighting time. Default 0.025.'), TypedEntity(name='gen_mean_minutes', type='float', structure='Passenger inter-arrival normal mean in minutes. Default 5.0.'), TypedEntity(name='gen_std_minutes', type='float', structure='Passenger inter-arrival normal std in minutes. Default 5.0.'), TypedEntity(name='gen_min_minutes', type='float', structure='Clamp lower bound for inter-arrival minutes. Default 1.0.'), TypedEntity(name='gen_max_minutes', type='float', structure='Clamp upper bound for inter-arrival minutes. Default 9.0.'), TypedEntity(name='init_passenger_time_seconds', type='float', structure='Time to create initialization passengers at all stations. Default 0.5.')], input_ports=[], output_ports=[])), StandardContextModel(class_name='StationServiceSystem', file_path=PosixPath('otrain_model/devs_project/OTrain_libs/StationServiceSystem.py'), logic_path='OTrain.StationServiceSystem', specification=ModelSpecification(function='Handles train arrival servicing at stations: alighting (from train_load to outside) and boarding (from station queue to train_load), both strictly serial with per-passenger service_time_seconds timing relative to the train arrival time.\\n\\nDelegated responsibilities from OTrain:\\n- Maintain in-train passenger storage grouped by destination: train_load[destination_station_id] as FIFO lists.\\n- On each train arrival at time t at station k (direction provided but used only for logging consistency):\\n  1) Alighting phase:\\n     - Let exiting_list = train_load[k] in FIFO order.\\n     - For j=1..len(exiting_list):\\n       - Schedule exit at time t + service_time_seconds * j.\\n       - Remove that passenger from train_load[k].\\n       - Emit passenger_exiting event at that exit time with entity_type=\"train_queue\" and station_id=k.\\n  2) Boarding phase:\\n     - Let boarding_queue = queue[k] (FIFO) managed by StationQueueSystem.\\n     - For m=1..len(boarding_queue) evaluated dynamically as passengers are removed:\\n       - Schedule boarding at time t + service_time_seconds * m (first boards at t+service_time_seconds).\\n       - Dequeue head passenger p from StationQueueSystem.\\n       - Append p into train_load[p[\\'destination\\']] FIFO.\\n       - Emit passenger_boarding event at that boarding time with entity_type=\"station_queue\" and station_id=k.\\n- Timing rule fidelity:\\n  - Both phases are triggered by the same train_arrival.\\n  - Ensure each passenger event time respects its phase’s rule (t + 0.025*j for exiting, t + 0.025*m for boarding).\\n  - If timestamps collide, ordering may be deterministic, e.g., process all exiting before boarding at the same timestamp.\\n\\nThis child does NOT schedule future train arrivals (handled by TrainMovementSystem) and does NOT generate passengers (handled by PassengerGenerationSystem).', logging='Write JSONL event objects (one per line) to the provided logger.\\n\\nFor every passenger_exiting event emitted by this child, log exactly these top-level keys:\\n- time: float\\n- event: str  # always \"passenger_exiting\"\\n- entity_type: str  # always \"train_queue\"\\n- station_id: int  # 1..5 (the station where the passenger exits; equals passenger.destination)\\n- station: str  # must match station_id mapping {1:\"Bayview\",2:\"Carling\",3:\"Carleton\",4:\"Confed\",5:\"Greenboro\"}\\n- payload: dict\\n  payload schema:\\n  {\\n    \\'passenger_id\\': int,\\n    \\'passenger_num\\': int,\\n    \\'origin\\': int,\\n    \\'destination\\': int\\n  }\\n\\nFor every passenger_boarding event emitted by this child, log exactly these top-level keys:\\n- time: float\\n- event: str  # always \"passenger_boarding\"\\n- entity_type: str  # always \"station_queue\"\\n- station_id: int  # 1..5 (the station where the passenger boards; equals passenger.origin)\\n- station: str  # must match station_id mapping\\n- payload: dict\\n  payload schema:\\n  {\\n    \\'passenger_id\\': int,\\n    \\'passenger_num\\': int,\\n    \\'origin\\': int,\\n    \\'destination\\': int\\n  }\\n\\nNo other stdout/stderr printing; only logger emission.', model_init_args=[TypedEntity(name='name', type='str', structure='Unique model instance name.'), TypedEntity(name='service_time_seconds', type='float', structure='Per-passenger boarding/alighting time. Default 0.025.')], input_ports=[PortEntity(name='train_arrival_in', type='dict', structure=\"Train arrival notification. Keys: 'station_id' (int, 1..5), 'direction' (int, 0 or 1).\", protocol=ProtocolSpec(initial_state='train_load[1..5] all empty at T=0; ready to process arrivals.', initial_signal='No initial signal (arrivals come from TrainMovementSystem).', description='Receives arrivals from [Sibling-TrainMovementSystem: train_arrival_out]. Each arrival triggers alighting then boarding logic for that station_id.')), PortEntity(name='dequeue_response_in', type='dict', structure=\"Response from station queue system. Keys: 'station_id' (int, 1..5), 'has_passenger' (bool), 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int),'destination'(int)) or {} if none).\", protocol=ProtocolSpec(initial_state='No pending dequeue responses at T=0.', initial_signal='No initial signal.', description='Receives dequeue results from [Sibling-StationQueueSystem: dequeue_response_out] to complete each scheduled boarding step for the corresponding station.'))], output_ports=[PortEntity(name='dequeue_request_out', type='dict', structure=\"Request to dequeue one passenger for boarding. Keys: 'station_id' (int, 1..5).\", protocol=ProtocolSpec(initial_state='No outstanding requests at T=0.', initial_signal='No initial signal.', description='Sends dequeue requests to [Sibling-StationQueueSystem: dequeue_request_in] as part of boarding handling after a train_arrival. Requests are issued in the order needed to realize serial boarding timing relative to the arrival time.'))]))] siblings=[StandardContextModel(class_name='TrainLoadStore', file_path=PosixPath('otrain_model/devs_project/OTrain_libs/StationServiceSystem_libs/TrainLoadStore.py'), logic_path='OTrain.StationServiceSystem.TrainLoadStore', specification=ModelSpecification(function=\"Own and maintain the in-train passenger storage grouped by destination: train_load[destination_station_id] as FIFO lists for destination_station_id in 1..5.\\n\\nDelegated from StationServiceSystem:\\n- Provide FIFO access to the list train_load[k] for a given station k.\\n- On alighting trigger for station k at a given train arrival time t:\\n  - Expose the current FIFO exiting_list = train_load[k] (all passengers whose destination is k).\\n  - Support removing passengers from train_load[k] in FIFO order as each passenger exits.\\n- On boarding completion for a passenger p:\\n  - Append p into train_load[p['destination']] FIFO.\\n\\nThis child does NOT schedule per-passenger times, does NOT request dequeues from StationQueueSystem, and does NOT emit passenger_exiting/passenger_boarding logs; it only mutates and reports train_load state as instructed.\", logging='No JSONL event logging in this child (passenger_exiting and passenger_boarding logs are emitted by [Sibling-ServiceOrchestrator]). If debug logging is implemented, it must be internal-only and must not print to stdout/stderr.', model_init_args=[TypedEntity(name='name', type='str', structure='Unique model instance name.')], input_ports=[PortEntity(name='alight_start_in', type='dict', structure=\"Alighting start command. Keys: 'station_id' (int, 1..5), 'arrival_time' (float).\", protocol=ProtocolSpec(initial_state='train_load[1..5] all empty at T=0; ready to accept alight/board commands.', initial_signal='No initial signal.', description='Receives alighting start from [Sibling-ServiceOrchestrator: alight_start_out] for station_id k at arrival_time t. Used to snapshot/iterate the current train_load[k] for FIFO removals.')), PortEntity(name='pop_exiting_in', type='dict', structure=\"Command to pop the next exiting passenger for station k. Keys: 'station_id' (int, 1..5).\", protocol=ProtocolSpec(initial_state='No pending pop operations at T=0.', initial_signal='No initial signal.', description='Receives pop requests from [Sibling-ServiceOrchestrator: pop_exiting_out] to remove one passenger from the head of train_load[station_id] (FIFO) during the alighting phase.')), PortEntity(name='append_boarded_in', type='dict', structure=\"Command to append a boarded passenger into train_load by destination. Keys: 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int,1..5),'destination'(int,1..5,!=origin)).\", protocol=ProtocolSpec(initial_state='Ready to accept boarded passengers at T=0.', initial_signal='No initial signal.', description=\"Receives boarded passenger from [Sibling-ServiceOrchestrator: boarded_passenger_out] and appends it to train_load[passenger['destination']] FIFO.\"))], output_ports=[PortEntity(name='alight_count_out', type='dict', structure=\"Alighting count response. Keys: 'station_id' (int, 1..5), 'count' (int, >=0).\", protocol=ProtocolSpec(initial_state='No pending responses at T=0.', initial_signal='No initial signal.', description='Sends to [Sibling-ServiceOrchestrator: alight_count_in] the number of passengers currently in train_load[station_id] at the moment alight_start_in is processed.')), PortEntity(name='exiting_passenger_out', type='dict', structure=\"Next exiting passenger popped from train_load. Keys: 'station_id' (int, 1..5), 'has_passenger' (bool), 'passenger' (dict with keys 'passenger_id'(int),'passenger_num'(int),'origin'(int),'destination'(int)) or {} if none).\", protocol=ProtocolSpec(initial_state='No pending exiting passenger messages at T=0.', initial_signal='No initial signal.', description='Responds to [Sibling-ServiceOrchestrator] on each pop_exiting_in with the popped passenger (FIFO) or has_passenger=false if empty.'))]))]"
+}

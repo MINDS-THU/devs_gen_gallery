@@ -1,0 +1,351 @@
+[
+  {
+    "class_name": "WaitingArea",
+    "file_path": "barbershop_model/devs_project/Barbershop_D1_libs/Reception_libs/WaitingArea.py",
+    "logic_path": "Barbershop_D1.Reception.WaitingArea",
+    "specification": {
+      "function": "Manages a FIFO waiting-area queue for reception with a strict fixed capacity.\n\nState machine / phases:\n- IDLE: Passive waiting for external events (arrivals and dequeue commands). No output.\n- SEND_UPDATE: Immediately (ta=0) emits one or more queued updates prepared during deltext, then returns to IDLE.\n\nExternal transition (deltext):\n1) Process all commands on input port `in_dequeue` first (to free space before accepting same-time arrivals):\n   - Each cmd must be a dict with `count`.\n   - If `count` is int and equals 1 and the internal queue is non-empty, dequeue exactly one (pop front).\n   - After each successful dequeue:\n     - log current queue length via `_log_queue_length_state()`\n     - append an update dict to `_pending_updates`: {\"queue_length\": <len(queue)>}\n2) Process all arrival tokens on input port `in_newcust`:\n   - Each token must be the literal string \"newcust\".\n   - If current queue length < capacity: enqueue one item.\n     - After each accepted enqueue:\n       - log current queue length\n       - append an update dict to `_pending_updates`: {\"queue_length\": <len(queue)>}\n   - If full (len(queue) == capacity): ignore silently (no log, no output, no state change).\n\nScheduling:\n- If any enqueue/dequeue occurred (`changed=True`), transition to phase SEND_UPDATE with sigma=0.0 so output is emitted immediately.\n- Otherwise remain in current phase with time adjustment; effectively stays in IDLE with infinite sigma.\n\nOutput function (lambdaf):\n- Only in phase SEND_UPDATE: emits every dict in `_pending_updates` on output port `queue_update`.\n\nInternal transition (deltint):\n- From SEND_UPDATE: clears `_pending_updates` and goes to IDLE with infinite time advance.\n- Otherwise: goes/stays IDLE.\n\nInitialization:\n- `initialize()` clears queue and pending updates and sets IDLE with infinite time advance.\n\nTermination:\n- `exit()` does nothing (explicitly no final logs).",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nOnly one logging helper is used: `_log_queue_length_state()` emits an INFO log.\n\nEmitted events (and only these):\n- After each accepted arrival enqueue (queue length increases)\n- After each successful dequeue (queue length decreases)\n\nNot emitted:\n- No logs when arrival is ignored due to full capacity.\n- No logs when dequeue command arrives while queue is empty.\n\nLog call:\n- level: info\n- log_type: \"PROCESS\"\n- msg: dict with structure:\n  - time (float): float(get_current_time())\n  - type (str): \"state\"\n  - model (str): \"reception\" (literal)\n  - field (str): \"total customers num\" (literal)\n  - value (int): len(self.queue) after the enqueue/dequeue operation; range 0..8",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique name of the model instance (passed to Atomic constructor)."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. Stored as `self.parent` but otherwise not used in logic; may be None for root."
+        },
+        {
+          "name": "capacity",
+          "type": "int",
+          "structure": "Maximum allowed queue length. This implementation enforces capacity must be exactly 8; otherwise raises ValueError. Used to decide whether to accept arrivals when queue is full."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "in_newcust",
+          "type": "str",
+          "structure": "Arrival token. Only the literal string \"newcust\" is considered valid; any other value/type is ignored.",
+          "protocol": {
+            "initial_state": "At T=0 queue is empty; no special tokens/credits.",
+            "initial_signal": "No initial signal.",
+            "description": "On reception of one or more values, process each token: if token==\"newcust\" and current queue length < capacity (8), enqueue one and schedule immediate SEND_UPDATE output; if full, ignore silently (no log/output)."
+          }
+        },
+        {
+          "name": "in_dequeue",
+          "type": "dict",
+          "structure": "Dequeue command dict with key: count (int). In this model, only count==1 is acted upon; other/malformed dicts are ignored.",
+          "protocol": {
+            "initial_state": "No pending dequeue at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "On reception of one or more command dicts, process each first (before arrivals at same sim time). If cmd[\"count\"] is int and equals 1 and queue non-empty, dequeue one from the front, log, and schedule immediate SEND_UPDATE output; if queue empty, ignore silently."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "queue_update",
+          "type": "dict",
+          "structure": "Queue length update dict: {\"queue_length\": int}. queue_length is the current length after an accepted enqueue or successful dequeue; range 0..8.",
+          "protocol": {
+            "initial_state": "No pending updates at T=0 (`_pending_updates` empty).",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted in phase SEND_UPDATE (ta=0) immediately after any accepted enqueue or successful dequeue. If multiple changes occur in the same external transition, multiple update dicts are emitted sequentially in the same output function call."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "CutHair",
+    "file_path": "barbershop_model/devs_project/Barbershop_D1_libs/CutHair.py",
+    "logic_path": "Barbershop_D1.CutHair",
+    "specification": {
+      "function": "Implements the `cuthair` atomic module for Barbershop_D1.\n\nBehavior / workflow (phases):\n- Initialization (`initialize`):\n  - Resets `total_customer_done=0` and `_pending_out=None`.\n  - Logs initial KPI state (PROCESS/state: field=\"total customer done\", value=0).\n  - Enters phase `IDLE` with infinite hold time.\n\n- `IDLE` phase:\n  - Waits indefinitely for an external token on input port `in_newcust`.\n  - On `deltext(e)`:\n    - Computes remaining time as `max(0, ta() - e)` for time-advance consistency.\n    - Scans all values on `input[\"in_newcust\"].values`.\n    - Accepts only the literal string token \"newcust\"; any other value/type is ignored silently.\n    - If token is \"newcust\" AND current phase is `IDLE`, starts service:\n      - Sets `_pending_out = \"done\"`.\n      - Transitions to `CUTTING` and holds for exactly `cut_time` seconds.\n    - If no valid start occurs, re-holds in the current phase for the remaining time.\n\n- `CUTTING` phase:\n  - Holds for exactly `cut_time` seconds.\n  - At the internal event time, output then state update occurs:\n    - `lambdaf` (output): if phase is `CUTTING` and `_pending_out==\"done\"`, sends \"done\" on output port `out` and logs PROCESS/message with port=\"out\" content=\"done\".\n    - `deltint` (internal transition at same simulation time):\n      - Increments `total_customer_done` by 1.\n      - Logs PROCESS/state with field=\"total customer done\" and updated cumulative value.\n      - Clears `_pending_out` and returns to `IDLE` with infinite hold.\n\nTime / service constraint:\n- Although `cut_time` is passed in, the model enforces an exact cutting duration of 20.0 seconds by overriding any non-20.0 input to 20.0.\n\nCoupling/submodels:\n- Atomic model only; no submodels.",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`; all logs are emitted via `self.logger.info(msg: dict, log_type=\"PROCESS\")`.\n\nEmitted events (all with `log_type=\"PROCESS\"`):\n1) Initial counter state (in `initialize`):\n   msg structure:\n   - time (float): `float(get_current_time())`\n   - type (str): \"state\"\n   - model (str): \"cuthair\"\n   - field (str): \"total customer done\"\n   - value (int): 0\n\n2) Cutting completion message (in `lambdaf` when output sent):\n   msg structure:\n   - time (float): current simulation time\n   - type (str): \"message\"\n   - model (str): \"cuthair\"\n   - port (str): \"out\"\n   - content (str): \"done\"\n\n3) Counter increment at completion (in `deltint` after `lambdaf`, same sim time):\n   msg structure:\n   - time (float): current simulation time\n   - type (str): \"state\"\n   - model (str): \"cuthair\"\n   - field (str): \"total customer done\"\n   - value (int): cumulative completed haircuts\n\nNotes:\n- Invalid input tokens are ignored without logging.\n- `exit()` produces no logs to keep schema strict.",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name; in this project expected to be the literal \"cuthair\". Passed to `Atomic.__init__`."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. If None, this atomic model is treated as a root. Stored as `self.parent` and otherwise unused internally."
+        },
+        {
+          "name": "cut_time",
+          "type": "float",
+          "structure": "Requested cutting duration in seconds. The model enforces an exact duration of 20.0 seconds: if `float(cut_time) != 20.0`, it overrides and uses 20.0; otherwise uses the provided value. Effective duration stored in `self.cut_time`."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "in_newcust",
+          "type": "str",
+          "structure": "Customer token. Expected/meaningful value: the literal string \"newcust\" only; other values/types are ignored.",
+          "protocol": {
+            "initial_state": "Model starts in phase IDLE with no job in service; no credits/tokens tracked on this port.",
+            "initial_signal": "No initial signal.",
+            "description": "External sender (sibling checkhair via its `to_cut`) may send \"newcust\" when a customer needs cutting. Upon receiving \"newcust\" while phase is IDLE, the model starts CUTTING and holds for exactly `cut_time` seconds. No queueing: if not IDLE, additional tokens have no effect."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "out",
+          "type": "str",
+          "structure": "Completion token. Output value is the literal string \"done\" only.",
+          "protocol": {
+            "initial_state": "No pending output at T=0; `_pending_out` is None.",
+            "initial_signal": "No initial signal.",
+            "description": "After exactly `cut_time` seconds of CUTTING, `lambdaf` emits \"done\" on port `out` (to sibling checkhair `in_done`) and logs a PROCESS/message. Then `deltint` increments `total_customer_done`, logs a PROCESS/state update, clears pending output, and returns to IDLE at the same simulation time."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "CheckHair",
+    "file_path": "barbershop_model/devs_project/Barbershop_D1_libs/CheckHair.py",
+    "logic_path": "Barbershop_D1.CheckHair",
+    "specification": {
+      "function": "Implements the `checkhair` atomic DEVS module of `Barbershop_D1`, coordinating between `reception` (upstream) and `cuthair` (downstream).\n\nBehavior (state machine):\n- Tracked state variables: `status` in {\"available\", \"busy_consult\", \"waiting_cut_done\"} and `customer` in {None, \"newcust\", \"done\"}.\n- DEVS phases used in execution: \"AVAILABLE\" (passive), \"BUSY_CONSULT\" (timed), \"WAITING_CUT_DONE\" (passive), \"SEND_DONE\" (immediate).\n\nProtocol / workflow:\n1) Start/initialize:\n   - Sets `status=\"available\"`, `customer=None`, no pending outputs, and holds in phase \"AVAILABLE\" with sigma=inf.\n2) Receive new customer (input port `in_cust`):\n   - Accepts token only if token == \"newcust\" AND `status==\"available\"`.\n   - On acceptance: sets `status=\"busy_consult\"`, `customer=\"newcust\"`, prepares `_pending_out_to_cut=\"newcust\"`, logs the state change, and schedules internal event by holding in \"BUSY_CONSULT\" for exactly `consult_time` seconds.\n   - If not acceptable (wrong token or not available), the input is ignored.\n3) Consultation completes (internal transition after `consult_time`):\n   - In `lambdaf` while phase == \"BUSY_CONSULT\": outputs \"newcust\" on `to_cut` (if pending).\n   - In `deltint` after output: logs the message send, clears pending-to-cut, sets `status=\"waiting_cut_done\"`, and holds in \"WAITING_CUT_DONE\" with sigma=inf.\n4) Receive cut completion (input port `in_done`):\n   - Accepts token only if token == \"done\" AND `status==\"waiting_cut_done\"`.\n   - On acceptance: sets `customer=\"done\"`, logs the state change, prepares `_pending_out_to_reception=\"done\"`, schedules immediate output by holding in phase \"SEND_DONE\" with sigma=0.\n   - Ordering guarantee: availability is considered restored only after the done-notification is emitted; the model uses phase \"SEND_DONE\" then internal transition back to \"AVAILABLE\".\n   - If not acceptable, the input is ignored.\n5) Send done to reception (immediate internal step):\n   - In `lambdaf` while phase == \"SEND_DONE\": outputs \"done\" on `to_reception` (if pending).\n   - In `deltint` after output: logs the message send, clears pending-to-reception, sets `status=\"available\"`, and holds in \"AVAILABLE\" with sigma=inf.\n\nTiming semantics:\n- `deltext(e)` adjusts remaining time for non-passive states by subtracting elapsed `e` from `ta()`.\n- Consultation duration is exactly `consult_time` seconds (validated to be exactly 7.0 by constructor constraint).",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nLog calls occur only via `self.logger.info(payload, log_type=\"PROCESS\")`.\n\nTwo log categories are produced (indicated by payload field `\"type\"`):\n1) State-change logs (`payload[\"type\"] == \"state\"`):\n   - When consultation starts (accepting \"newcust\"): \n     payload structure:\n     {\"time\": float(get_current_time()), \"type\": \"state\", \"model\": \"checkhair\", \"field\": \"customer\", \"value\": \"newcust\"}\n   - When cut completion is received (accepting \"done\"): \n     payload structure:\n     {\"time\": float(get_current_time()), \"type\": \"state\", \"model\": \"checkhair\", \"field\": \"customer\", \"value\": \"done\"}\n\n2) Message-send logs (`payload[\"type\"] == \"message\"`), emitted in `deltint` after `lambdaf`:\n   - After sending to cutter:\n     payload structure:\n     {\"time\": float(get_current_time()), \"type\": \"message\", \"model\": \"checkhair\", \"port\": \"to_cut\", \"content\": \"newcust\"}\n   - After sending to reception:\n     payload structure:\n     {\"time\": float(get_current_time()), \"type\": \"message\", \"model\": \"checkhair\", \"port\": \"to_reception\", \"content\": \"done\"}\n\nNotes:\n- The implementation uses `_last_sent_port` and `_last_sent_content` to ensure the message log time matches the send time (same simulation time), with logging executed in `deltint` after outputs are produced in `lambdaf`.\n- No additional logs are produced in `exit()`.",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name passed to `Atomic.__init__`. Used as the DEVS model identifier (also used by logger via `get_sim_logger(self)`)."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to the parent coupled model (stored as `self.parent`). May be None if this is the root model. Not otherwise used for logic in this class."
+        },
+        {
+          "name": "consult_time",
+          "type": "float",
+          "structure": "Exact consultation duration in seconds. Hard constraint enforced at init: must be exactly 7.0 within tolerance 1e-9, otherwise raises `ValueError`. Used to schedule the timed phase \"BUSY_CONSULT\" in `deltext` upon accepting \"newcust\"."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "in_cust",
+          "type": "str",
+          "structure": "Customer token. Expected literal: \"newcust\" only. Other values are ignored. Values are read from `self.input[\"in_cust\"].values` (iterable of tokens); the model accepts at most one token per external transition due to immediate `return` after acceptance.",
+          "protocol": {
+            "initial_state": "Ready at T=0 because model initializes with `status=\"available\"` and phase \"AVAILABLE\" (sigma=inf). No queued/credit semantics.",
+            "initial_signal": "No initial signal emitted/required on this input port.",
+            "description": "Processed in `deltext(e)`. Acceptance condition: token == \"newcust\" AND `status==\"available\"`. On acceptance, starts consultation timer by holding in \"BUSY_CONSULT\" for `consult_time` seconds; otherwise input is ignored."
+          }
+        },
+        {
+          "name": "in_done",
+          "type": "str",
+          "structure": "Completion token from cutter. Expected literal: \"done\" only. Other values are ignored. Values are read from `self.input[\"in_done\"].values`; the model accepts at most one token per external transition due to immediate `return` after acceptance.",
+          "protocol": {
+            "initial_state": "Empty/no expectation at initialization; meaningful only after the model reaches `status=\"waiting_cut_done\"` (phase \"WAITING_CUT_DONE\").",
+            "initial_signal": "No initial signal emitted/required on this input port.",
+            "description": "Processed in `deltext(e)`. Acceptance condition: token == \"done\" AND `status==\"waiting_cut_done\"`. On acceptance, schedules immediate output by holding in phase \"SEND_DONE\" with sigma=0; otherwise input is ignored."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "to_cut",
+          "type": "str",
+          "structure": "Forwarded customer token to cutting module. Emitted literal: \"newcust\" only. Produced via `self.output[\"to_cut\"].add(token)` in `lambdaf` when phase == \"BUSY_CONSULT\" and `_pending_out_to_cut` is set.",
+          "protocol": {
+            "initial_state": "No pending sends at initialization (`_pending_out_to_cut=None`).",
+            "initial_signal": "No initial output.",
+            "description": "Emission occurs exactly after consultation completes: model holds in \"BUSY_CONSULT\" for `consult_time` seconds, then `lambdaf` emits \"newcust\" and `deltint` transitions to waiting state. A corresponding message log is written in `deltint` after `lambdaf`."
+          }
+        },
+        {
+          "name": "to_reception",
+          "type": "str",
+          "structure": "Notification token to reception that service is complete and model becomes available again. Emitted literal: \"done\" only. Produced via `self.output[\"to_reception\"].add(token)` in `lambdaf` when phase == \"SEND_DONE\" and `_pending_out_to_reception` is set.",
+          "protocol": {
+            "initial_state": "No pending sends at initialization (`_pending_out_to_reception=None`).",
+            "initial_signal": "No initial output.",
+            "description": "Emission occurs immediately (sigma=0) after accepting \"done\" on `in_done`: `deltext` sets phase \"SEND_DONE\" with 0.0, `lambdaf` emits \"done\", then `deltint` logs the message and transitions to \"AVAILABLE\". Ordering is enforced so the notification is sent before becoming available."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "ReceptionCoordinator",
+    "file_path": "barbershop_model/devs_project/Barbershop_D1_libs/Reception_libs/ReceptionCoordinator.py",
+    "logic_path": "Barbershop_D1.Reception.ReceptionCoordinator",
+    "specification": {
+      "function": "Orchestrates the reception/check-in workflow and the handoff to the checkhair resource using explicit DEVS phases and timing.\n\nCore responsibilities:\n- Track `queue_length` from `in_queue_update` messages.\n- Track checkhair availability from `in_done` messages (\"done\" => available).\n- Enforce an exact check-in delay (`checkin_time`, specified as 5.0 seconds).\n- Perform a handoff to checkhair when (a) check-in completes and checkhair is available, or (b) model is blocked and later receives \"done\".\n- After every successful handoff, command the waiting_area to dequeue exactly 1 customer, then wait for a subsequent queue update before starting the next check-in.\n\nPhases / workflow:\n- IDLE (sigma=inf): no active check-in; waits for `in_queue_update` and/or `in_done`. If not blocked, not processing, not awaiting a post-dequeue update, and `queue_length>0`, starts CHECKIN.\n- CHECKIN (sigma=`checkin_time`): holds for the exact check-in time; emits no output when the timeout occurs.\n  - On CHECKIN timeout (internal transition):\n    - If `queue_length>0` and `checkhair_available` is True: immediately schedule HANDOFF at the same sim time (sigma=0), set `checkhair_available=False`, set `awaiting_dequeue_update=True`, and prepare outputs.\n    - Else: if `queue_length>0` and checkhair unavailable -> enter BLOCKED (sigma=inf); otherwise go to IDLE.\n- HANDOFF (sigma=0): on lambdaf, emits `cust=\"newcust\"` and `dequeue_cmd={\"count\":1}`; then internally transitions to WAIT_QUEUE_UPDATE.\n- BLOCKED (sigma=inf): check-in is complete but cannot handoff; waits for `in_done=\"done\"`. Upon receiving \"done\" and if `queue_length>0`, immediately schedules HANDOFF at same sim time (sigma=0).\n- WAIT_QUEUE_UPDATE (sigma=inf): after a handoff+dequeue, waits until a queue update arrives; once received, clears `awaiting_dequeue_update` and may start next CHECKIN if `queue_length>0`.\n\nCommunication protocol behavior:\n- Start: model initializes in IDLE with `checkhair_available=True`, `queue_length=0`.\n- Receive:\n  - `in_done`: only reacts to literal \"done\" by setting `checkhair_available=True`; if currently BLOCKED and `queue_length>0`, triggers immediate HANDOFF.\n  - `in_queue_update`: consumes latest `queue_length` integer update; if it arrives while awaiting a post-dequeue update, clears `awaiting_dequeue_update`.\n- Send:\n  - Only during HANDOFF lambdaf: sends `cust=\"newcust\"` (and logs it) and sends `dequeue_cmd={\"count\":1}`.\n- No explicit end/termination behavior.",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nEmitted logs (only in this model):\n- When sending `cust=\"newcust\"` during HANDOFF:\n  - level: info\n  - log_type: \"PROCESS\"\n  - msg structure (dict):\n    - time (float): `float(get_current_time())`\n    - type (str): literal \"message\"\n    - model (str): literal \"reception\"\n    - port (str): literal \"cust\"\n    - content (str): literal \"newcust\"\n\nNo other logs are required/produced (exit() does nothing).",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name passed to Atomic base class."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. Stored as `self.parent`. If None, model is a root model. Not used in internal logic beyond being stored."
+        },
+        {
+          "name": "checkin_time",
+          "type": "float",
+          "structure": "Exact check-in processing time in seconds. Cast to float and stored as `self.checkin_time`. Docstring states it must be 5.0; code does not enforce equality but uses the provided value for CHECKIN hold time."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "in_done",
+          "type": "str",
+          "structure": "Literal string \"done\" only. Other strings are ignored by the model.",
+          "protocol": {
+            "initial_state": "No pending notifications. Internal `checkhair_available` starts True at T=0.",
+            "initial_signal": "No initial signal.",
+            "description": "On receiving \"done\": set `checkhair_available=True`. If currently in BLOCKED and `queue_length>0`, schedule immediate HANDOFF at the same simulation time (sigma=0) which will emit `cust` and `dequeue_cmd`."
+          }
+        },
+        {
+          "name": "in_queue_update",
+          "type": "dict",
+          "structure": "Dictionary with key `queue_length` (int): current queue length after enqueue/dequeue; expected range 0..8 per docstring. Model accepts any int and casts to int.",
+          "protocol": {
+            "initial_state": "No updates at T=0; internal `queue_length` starts at 0 (queue assumed empty until first update).",
+            "initial_signal": "No initial signal.",
+            "description": "Consumes updates; keeps the latest valid `queue_length`. If `awaiting_dequeue_update` is True and at least one queue update is received, clears `awaiting_dequeue_update`. May trigger starting CHECKIN when IDLE and allowed, or allow next CHECKIN after dequeue update."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "cust",
+          "type": "str",
+          "structure": "Literal string \"newcust\" only.",
+          "protocol": {
+            "initial_state": "No pending sends.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted only during HANDOFF (sigma=0) after check-in completes and checkhair is available, or immediately upon receiving \"done\" if previously BLOCKED and `queue_length>0`."
+          }
+        },
+        {
+          "name": "dequeue_cmd",
+          "type": "dict",
+          "structure": "Dictionary with key `count` (int): number of customers to remove; always 1 (derived from internal param `dequeue_count`).",
+          "protocol": {
+            "initial_state": "No pending commands.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted only during HANDOFF, immediately after each successful `cust` handoff. After emitting, the model enters WAIT_QUEUE_UPDATE and will not start the next check-in until a subsequent `in_queue_update` arrives."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "Reception",
+    "file_path": "barbershop_model/devs_project/Barbershop_D1_libs/Reception.py",
+    "logic_path": "Barbershop_D1.Reception",
+    "specification": {
+      "function": "Implements the `reception` module boundary for Barbershop_D1 as a coupled/container model.\n\nResponsibilities:\n- Accept external arrival tokens and route them to an internal capacity-limited FIFO waiting area.\n- Accept `checkhair` completion/availability notifications and route them to an internal coordinator.\n- Connect waiting-area queue-length updates to the coordinator so the coordinator can decide when to perform check-in and when to hand off customers to `checkhair`.\n- Expose the coordinator’s customer handoff as the coupled model’s external output.\n\nSub-models (class -> instance name):\n- WaitingArea -> `waiting_area`: Manages the capacity-limited FIFO queue; emits queue length updates.\n- ReceptionCoordinator -> `coordinator`: Performs check-in timing (configured as 5.0s) and handoff to `checkhair`; issues dequeue commands to the waiting area.\n\nCouplings / communication flow:\n- EIC: `Reception.in_newcust` -> `waiting_area.in_newcust` (external arrivals forwarded for capacity check/enqueue).\n- EIC: `Reception.in_done` -> `coordinator.in_done` (checkhair done notifications forwarded).\n- IC: `waiting_area.queue_update` -> `coordinator.in_queue_update` (queue length updates inform coordinator).\n- IC: `coordinator.dequeue_cmd` -> `waiting_area.in_dequeue` (coordinator commands dequeue after handoff).\n- EOC: `coordinator.cust` -> `Reception.cust` (customer token handed off externally).\n\nInitialization / boundary enforcement:\n- On construction, enforces scenario constants at boundary:\n  - `capacity` must be int == 8 (else ValueError).\n  - `checkin_time` must be float and equal to 5.0 (else ValueError).\n- Creates the two submodels and installs the above couplings.\n\nNo additional DEVS dynamic behavior is implemented at this coupled level beyond wiring; all timing/state-machine behavior is inside sub-models.",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nEmitted log event(s) in this coupled model:\n- On successful construction (end of `__init__`):\n  - level: info\n  - log_type: \"PROCESS\"\n  - msg structure (dict):\n    - event (str): literal \"Model Created\"\n    - model (str): literal \"reception\"\n    - capacity (int): validated waiting-area capacity (must be 8)\n    - checkin_time (float): float(checkin_time), validated to equal 5.0\n    - param (dict): internal fixed parameters\n      - model_scope (str): literal \"Barbershop_D1.Reception\"\n\nNo other logs are produced by this model (sub-model logging is separate).",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique name of the coupled model instance (passed to `Coupled` constructor)."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. Stored as `self.parent`; may be None for a root model. Not used further in this model’s logic."
+        },
+        {
+          "name": "capacity",
+          "type": "int",
+          "structure": "Waiting area capacity. Must be exactly int == 8; otherwise `ValueError` is raised. Passed through to submodel `WaitingArea(capacity=capacity)`."
+        },
+        {
+          "name": "checkin_time",
+          "type": "float",
+          "structure": "Exact check-in processing time in seconds. Must be a float and must equal 5.0 (checked via `isinstance(checkin_time, float)` and `float(checkin_time) == 5.0`); otherwise `ValueError` is raised. Passed through to submodel `ReceptionCoordinator(checkin_time=checkin_time)`."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "in_newcust",
+          "type": "str",
+          "structure": "External arrival token. Expected literal string \"newcust\"; forwarded unchanged to `waiting_area.in_newcust`.",
+          "protocol": {
+            "initial_state": "No initial signal; model has no internal state at this boundary.",
+            "initial_signal": "No initial signal.",
+            "description": "Any received values are forwarded via EIC to `WaitingArea.in_newcust`, where capacity check/enqueue and any subsequent queue-update emission are handled."
+          }
+        },
+        {
+          "name": "in_done",
+          "type": "str",
+          "structure": "Availability notification from checkhair. Expected literal string \"done\"; forwarded unchanged to `coordinator.in_done`.",
+          "protocol": {
+            "initial_state": "No initial signal; model has no internal state at this boundary.",
+            "initial_signal": "No initial signal.",
+            "description": "Any received values are forwarded via EIC to `ReceptionCoordinator.in_done`, which updates checkhair availability and may trigger immediate handoff depending on its phase/state."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "cust",
+          "type": "str",
+          "structure": "Customer token emitted to external environment (checkhair). Literal string \"newcust\" produced by the coordinator and forwarded via EOC.",
+          "protocol": {
+            "initial_state": "No initial signal.",
+            "initial_signal": "No initial signal.",
+            "description": "This output is produced only by the internal `ReceptionCoordinator.cust` port (during its handoff behavior) and is forwarded to the coupled model output via EOC."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "Barbershop_D1",
+    "file_path": "barbershop_model/devs_project/Barbershop_D1.py",
+    "logic_path": "Barbershop_D1",
+    "specification": {
+      "function": "Coupled/container DEVS model implementing the Barbershop_D1 workflow.\n\nResponsibilities / behavior:\n- Defines the system boundary for Barbershop_D1.\n- Accepts external customer arrival tokens on `in_newcust` and forwards them to the internal `reception` module.\n- Wires internal modules to realize the service workflow loop:\n  1) External -> `reception` (enqueue/check-in)\n  2) `reception` -> `checkhair` (customer handoff)\n  3) `checkhair` -> `cuthair` (after consult)\n  4) `cuthair` -> `checkhair` (cut done)\n  5) `checkhair` -> `reception` (done/availability notification)\n\nSub-models (class -> instance name), as constructed in `__init__`:\n- Reception -> `reception`\n  - created with fixed parameters: `capacity=8`, `checkin_time=5.0`\n- CheckHair -> `checkhair`\n  - created with fixed parameter: `consult_time=7.0`\n- CutHair -> `cuthair`\n  - created with fixed parameter: `cut_time=20.0`\n\nCouplings:\n- EIC: `Barbershop_D1.in_newcust` -> `reception.in_newcust`\n- IC: `reception.cust` -> `checkhair.in_cust`\n- IC: `checkhair.to_cut` -> `cuthair.in_newcust`\n- IC: `cuthair.out` -> `checkhair.in_done`\n- IC: `checkhair.to_reception` -> `reception.in_done`\n\nScenario constants / parameters:\n- This coupled model sets internal fixed parameters in `self.param` (not provided as init args):\n  - model_scope=\"Barbershop_D1\", capacity=8, checkin_time=5.0, consult_time=7.0, cut_time=20.0\n- No additional DEVS timing/state logic exists at this coupled level beyond constructing components and couplings.",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nEmitted log event(s) in this model:\n- At end of `__init__` (one-time construction log):\n  - level: info\n  - log_type: \"PROCESS\"\n  - msg structure (dict):\n    - event (str): literal \"Model Created\"\n    - model (str): literal \"Barbershop_D1\"\n    - param (dict):\n      - model_scope (str): \"Barbershop_D1\"\n      - capacity (int): 8\n      - checkin_time (float): 5.0\n      - consult_time (float): 7.0\n      - cut_time (float): 20.0\n\nNo other logs are produced by this coupled model; sub-model logging is handled in those models.",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique name of this coupled model instance (passed to `Coupled.__init__`). Used as the DEVS identifier and by the simulation logger."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to the parent coupled model; stored as `self.parent`. If None, this is a root model. Not otherwise used for behavior beyond being passed as parent to sub-model instances."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "in_newcust",
+          "type": "str",
+          "structure": "External arrival token for a new customer. Expected literal string \"newcust\" (the coupled model forwards whatever it receives; semantic validation occurs in downstream submodels).",
+          "protocol": {
+            "initial_state": "No initial signal; coupled model has no dynamic state/credits at boundary.",
+            "initial_signal": "No initial signal.",
+            "description": "Any token received on `in_newcust` is coupled (EIC) directly to `reception.in_newcust`."
+          }
+        }
+      ],
+      "output_ports": []
+    }
+  }
+]

@@ -1,0 +1,188 @@
+[
+  {
+    "class_name": "SEIRDIntegrator",
+    "file_path": "seird_model/devs_project/SEIRD_D1_libs/SEIRDIntegrator.py",
+    "logic_path": "SEIRD_D1.SEIRDIntegrator",
+    "specification": {
+      "function": "Atomic DEVS model that numerically integrates an SEIRD epidemic system using a fixed-step (dt) Euler method in discrete simulation time, where 1.0 time unit = 1 day.\n\nWorkflow / phases:\n- initialize(): sets initial compartment values at absolute time t=0.0 (S=N-I0, E=0, I=I0, R=0, D=0). If simulation_time <= eps_time OR dt <= eps_time, it immediately prepares a final snapshot and transitions to phase FINAL with sigma=0. Otherwise it enters RUN with sigma=dt.\n- RUN (deltint): at each internal transition, compute remaining time to simulation end. If already at end, prepare final snapshot and go to FINAL. Else perform one Euler step with dt_step=min(dt, remaining) via _step_once(dt_step), advancing compartments using flows computed from OLD values. Then either schedule next RUN (sigma=min(dt, remaining_after)) or prepare final snapshot and go to FINAL.\n- FINAL (lambdaf + deltint): lambdaf emits exactly one dict on final_state_out. Then deltint moves to PASSIVE with infinite time advance.\n- deltext(e): no input ports; simply discounts elapsed time by reducing remaining sigma while keeping the same phase.\n- exit(): logs a final snapshot (does not change outputs).\n\nDynamics in one Euler step (_step_once):\n- new_exposed = (beta * S_old * I_old / N) * dt_step, capped to S_old; if N<=0 then 0\n- new_infective = (E_old / incubation_period) * dt_step, capped to E_old; if incubation_period<=0 then 0\n- mortality_frac = mortality/100\n- new_deceased = (I_old / infectivity_period) * mortality_frac * dt_step; if infectivity_period<=0 then 0\n- new_recovered = (I_old / infectivity_period) * (1-mortality_frac) * dt_step; if infectivity_period<=0 then 0\n- compartment updates:\n  S -= new_exposed\n  E += new_exposed - new_infective\n  I += new_infective - new_deceased - new_recovered\n  R += new_recovered\n  D += new_deceased\n  t += dt_step\n\nSub-models: None (Atomic model).",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'model': <str model name>, 'test_name': <str>, 'config': {'mortality': <float>, 'infectivity_period': <float>, 'dt': <float>, 'incubation_period': <float>, 'total_population': <int>, 'initial_infective': <int>, 'transmission_rate': <float>, 'simulation_time': <float>}}\", \"description\": \"Emitted in __init__ right after configuration is stored, indicating model construction and the configuration parameters used.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Initialized', 'state': {'time': <float>, 'S': <float>, 'E': <float>, 'I': <float>, 'R': <float>, 'D': <float>, 'N': <float>}}\", \"description\": \"Emitted in initialize() after initial compartment values are set at t=0.0.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Final State Prepared', 'time': <float>, 'S': <float>, 'E': <float>, 'I': <float>, 'R': <float>, 'D': <float>, 'N': <float>}\", \"description\": \"Emitted in deltint() when the model prepares the final snapshot (either because it is already at end time, or right after the last integration step). Payload matches final_state_out structure (full precision), plus the 'event' field.\"}, {\"log_type\": \"RESULT\", \"msg\": \"{'event': 'Model Finalized', 'time': <float>, 'S': <float>, 'E': <float>, 'I': <float>, 'R': <float>, 'D': <float>, 'N': <float>}\", \"description\": \"Emitted in exit() when the model is terminating; logs the final snapshot (from _final_payload if available, otherwise current state). Payload matches final_state_out structure (full precision), plus the 'event' field.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique DEVS model instance name (passed to Atomic super().__init__). Used in logs as 'model'."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. Stored as self.parent; not otherwise used in dynamics."
+        },
+        {
+          "name": "test_name",
+          "type": "str",
+          "structure": "Arbitrary test case identifier used only for logging (no effect on dynamics). Logged under 'test_name'."
+        },
+        {
+          "name": "mortality",
+          "type": "float",
+          "structure": "Mortality percentage in [0.0, 100.0]. Internally converted to fraction mortality/100 for deceased vs recovered split."
+        },
+        {
+          "name": "infectivity_period",
+          "type": "float",
+          "structure": "Average infectious duration in days (>0 expected). Used as denominator for outflow from I to R/D; if <=0, set new_deceased=new_recovered=0."
+        },
+        {
+          "name": "dt",
+          "type": "float",
+          "structure": "Fixed integration time step in days (>0 expected). Used as the RUN phase holding time and Euler dt_step (truncated on last step to not exceed simulation_time). If <= eps_time, model finalizes immediately in initialize()."
+        },
+        {
+          "name": "incubation_period",
+          "type": "float",
+          "structure": "Average incubation duration in days (>0 expected). Used as denominator for transition E->I; if <=0, set new_infective=0."
+        },
+        {
+          "name": "total_population",
+          "type": "int",
+          "structure": "Total population N (integer >=0). Converted to float for computation. If N<=0, exposure flow is set to 0 to avoid division by zero."
+        },
+        {
+          "name": "initial_infective",
+          "type": "int",
+          "structure": "Initial infective count I0 (integer >=0, typically <= total_population). Initial state uses S=N-I0, I=I0."
+        },
+        {
+          "name": "transmission_rate",
+          "type": "float",
+          "structure": "Transmission rate beta per day (typically >=0). Used in new_exposed calculation beta*S*I/N."
+        },
+        {
+          "name": "simulation_time",
+          "type": "float",
+          "structure": "Total simulation duration in days (>=0). Integration runs until t reaches this value (within eps_time). Final output time is <= simulation_time."
+        }
+      ],
+      "input_ports": [],
+      "output_ports": [
+        {
+          "name": "final_state_out",
+          "type": "dict",
+          "structure": "Final simulation snapshot dict emitted exactly once at end-of-simulation.\nKeys:\n- time (float): final absolute simulation time used (<= simulation_time)\n- S (float): susceptible count (full precision)\n- E (float): exposed count (full precision)\n- I (float): infective count (full precision)\n- R (float): recovered count (full precision)\n- D (float): deceased count (full precision)\n- N (float): total population (constant, full precision)",
+          "protocol": {
+            "initial_state": "No initial credits/tokens specified by the model. Port is created during __init__ and is empty until FINAL.",
+            "initial_signal": "None. No output is sent at initialization unless simulation_time<=eps_time or dt<=eps_time triggers immediate FINAL; even then, output occurs when FINAL phase executes lambdaf (sigma=0).",
+            "description": "End-of-simulation reporting: model transitions to phase FINAL with sigma=0 once t reaches simulation_time (or immediately if simulation_time<=eps_time or dt<=eps_time). In lambdaf during FINAL, it adds exactly one snapshot dict to final_state_out. After that, internal transition moves to PASSIVE (infinite ta) and no further outputs occur."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "SEIRDReporter",
+    "file_path": "seird_model/devs_project/SEIRD_D1_libs/SEIRDReporter.py",
+    "logic_path": "SEIRD_D1.SEIRDReporter",
+    "specification": {
+      "function": "Atomic DEVS reporter that waits indefinitely for a single final SEIRD snapshot (full precision) on input port `final_state_in`. Upon receiving (in `deltext`) the snapshot dict, it constructs a pending JSON-serializable report dict with required keys and values rounded to `param['round_decimals']` (hardcoded to 2). It then transitions to phase `EMIT` with sigma=0 so that `lambdaf` immediately logs the final report (no output ports are used). After the internal transition (`deltint`) in `EMIT`, it clears the pending record and returns to `WAIT` with sigma=inf.\n\nProtocol/state workflow:\n- initialize(): logs \"Model Initialized\" and enters WAIT (sigma=inf).\n- WAIT: no outputs; expects one message on `final_state_in`.\n- deltext(e): for each received snapshot in `final_state_in.values`, prepares `_pending_log_record` with schema {time,susceptible,exposed,infective,recovered,deceased} and rounds values; sets phase=EMIT, sigma=0.\n- EMIT: lambdaf logs the RESULT record; no ports output.\n- deltint(): returns to WAIT (sigma=inf).",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{ 'event': 'Model Created', 'test_name': <str> }\", \"description\": \"Emitted during __init__ after ports/config are set. Indicates the model instance was created.\"}, {\"log_type\": \"PROCESS\", \"msg\": \"{ 'event': 'Model Initialized', 'test_name': <str> }\", \"description\": \"Emitted during initialize() right before entering WAIT (sigma=inf).\"}, {\"log_type\": \"RESULT\", \"msg\": \"{ 'time': <float>, 'susceptible': <float rounded to 2 decimals>, 'exposed': <float rounded to 2 decimals>, 'infective': <float rounded to 2 decimals>, 'recovered': <float rounded to 2 decimals>, 'deceased': <float rounded to 2 decimals> }\", \"description\": \"Emitted in lambdaf when phase==EMIT and `_pending_log_record` is set (after receiving `final_state_in`). This is the required final JSON event for stdout/JSONL contract.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name passed to Atomic superclass; used for identification/logging."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. If None, this atomic is a root model. Stored as `self.parent` but not otherwise used in behavior."
+        },
+        {
+          "name": "test_name",
+          "type": "str",
+          "structure": "Arbitrary test case identifier included in PROCESS logs (\"Model Created\", \"Model Initialized\"); does not affect dynamics."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "final_state_in",
+          "type": "dict",
+          "structure": "Final simulation snapshot dict from a sibling integrator. Expected keys (all optional in code, defaulting when missing):\n- time (float): final absolute simulation time; if missing uses `get_current_time()`.\n- S (float): susceptible (full precision)\n- E (float): exposed (full precision)\n- I (float): infective (full precision)\n- R (float): recovered (full precision)\n- D (float): deceased (full precision)\n- N (float): total population (may be present; unused here)\nValues are cast to float before rounding.",
+          "protocol": {
+            "initial_state": "At t=0 after initialize(), model is in phase WAIT with sigma=inf; no buffered messages and `_pending_log_record=None`.",
+            "initial_signal": "No initial signal is sent; no output ports exist.",
+            "description": "Receives exactly one (or potentially more, but last processed wins) snapshot dict message(s) on `final_state_in`. On receipt, immediately schedules EMIT (sigma=0) to log the final report in lambdaf, then returns to WAIT."
+          }
+        }
+      ],
+      "output_ports": []
+    }
+  },
+  {
+    "class_name": "SEIRD_D1",
+    "file_path": "seird_model/devs_project/SEIRD_D1.py",
+    "logic_path": "SEIRD_D1",
+    "specification": {
+      "function": "Coupled DEVS model that builds a complete SEIRD simulation-and-reporting pipeline by composing two atomic submodels and coupling them.\n\nResponsibilities:\n- Instantiate `SEIRDIntegrator` (instance name: `integrator`) to numerically integrate the SEIRD dynamics for `simulation_time` days using fixed step `dt`, starting from `total_population` and `initial_infective`, using `mortality`, `infectivity_period`, `incubation_period`, `transmission_rate`.\n- Instantiate `SEIRDReporter` (instance name: `reporter`) to receive the integrator’s final snapshot and log the required RESULT JSON (rounded to 2 decimals).\n- Define internal coupling: `integrator.output['final_state_out'] -> reporter.input['final_state_in']`.\n- No external input/output ports on this coupled model; all reporting is done by the reporter submodel’s logging.\n\nSub-models (class -> instance name):\n- `SEIRDIntegrator` -> `integrator`\n- `SEIRDReporter` -> `reporter`\n\nCommunication protocol (within coupled model):\n- Start: On construction, submodels are created and added; coupling is established.\n- Data exchange: When the integrator reaches end-of-simulation, it emits exactly one final snapshot dict on `final_state_out`, which is routed to the reporter’s `final_state_in`.\n- End: Reporter logs the final RESULT record upon receipt; this coupled model itself emits no data.",
+      "logging": "[{\"log_type\": \"PROCESS\", \"msg\": \"{'event': 'Model Created', 'model': <str coupled model name>, 'test_name': <str>, 'config': {'mortality': <float>, 'infectivity_period': <float>, 'dt': <float>, 'incubation_period': <float>, 'total_population': <int>, 'initial_infective': <int>, 'transmission_rate': <float>, 'simulation_time': <float>}}\", \"description\": \"Emitted in `__init__` after submodels are created, added, and coupled. Records coupled model creation along with the configuration that will be used by the integrator/reporter pipeline.\"}]",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique coupled model instance name passed to `Coupled.__init__` and logged as `model` in this model’s PROCESS log."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. Stored as `self.parent`. If None, this model is a root model. Not otherwise used internally."
+        },
+        {
+          "name": "test_name",
+          "type": "str",
+          "structure": "Arbitrary test case identifier. Passed through to both submodels and included in this model’s creation log under `test_name`."
+        },
+        {
+          "name": "mortality",
+          "type": "float",
+          "structure": "Mortality percentage in [0.0, 100.0]. Passed to `SEIRDIntegrator` and logged in `config.mortality` (cast to float)."
+        },
+        {
+          "name": "infectivity_period",
+          "type": "float",
+          "structure": "Average infectious duration in days (>0 expected). Passed to `SEIRDIntegrator` and logged in `config.infectivity_period` (cast to float)."
+        },
+        {
+          "name": "dt",
+          "type": "float",
+          "structure": "Fixed integration time step in days (>0 expected). Passed to `SEIRDIntegrator` and logged in `config.dt` (cast to float)."
+        },
+        {
+          "name": "incubation_period",
+          "type": "float",
+          "structure": "Average incubation duration in days (>0 expected). Passed to `SEIRDIntegrator` and logged in `config.incubation_period` (cast to float)."
+        },
+        {
+          "name": "total_population",
+          "type": "int",
+          "structure": "Total population N (integer >=0). Passed to `SEIRDIntegrator` and logged in `config.total_population` (cast to int)."
+        },
+        {
+          "name": "initial_infective",
+          "type": "int",
+          "structure": "Initial infective count I0 (integer >=0; should be <= total_population). Passed to `SEIRDIntegrator` and logged in `config.initial_infective` (cast to int)."
+        },
+        {
+          "name": "transmission_rate",
+          "type": "float",
+          "structure": "Transmission rate beta per day (typically >=0). Passed to `SEIRDIntegrator` and logged in `config.transmission_rate` (cast to float)."
+        },
+        {
+          "name": "simulation_time",
+          "type": "float",
+          "structure": "Total simulation duration in days (>=0). Passed to `SEIRDIntegrator` and logged in `config.simulation_time` (cast to float)."
+        }
+      ],
+      "input_ports": [],
+      "output_ports": []
+    }
+  }
+]

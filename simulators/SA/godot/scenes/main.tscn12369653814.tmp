@@ -1,0 +1,392 @@
+[gd_scene format=3 uid="uid://hqplwbqpng5r"]
+
+[ext_resource type="Texture2D" uid="uid://bchh4wn3ayam8" path="res://design/panoramic_bg.png" id="1_bg"]
+[ext_resource type="Script" uid="uid://53xr4jh2nbiq" path="res://scripts/main_simulation.gd" id="2_sim"]
+[ext_resource type="Texture2D" uid="uid://ua5efnd02xmc" path="res://design/icon_cube_blue.png" id="3_icon_gen"]
+[ext_resource type="Texture2D" uid="uid://yp1p5wumjyrs" path="res://design/icon_clock.png" id="4_icon_queue"]
+[ext_resource type="Texture2D" uid="uid://deed1u50bc8t7" path="res://design/icon_cube_green.png" id="5_icon_delivered"]
+[ext_resource type="Texture2D" uid="uid://b0qv5lq7alujg" path="res://design/icon_trash_red.png" id="6_icon_expired"]
+
+[node name="MainUI" type="Control" unique_id=1660658554]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Background" type="TextureRect" parent="." unique_id=125351916]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+texture = ExtResource("1_bg")
+expand_mode = 1
+stretch_mode = 6
+
+[node name="WorldLayer" type="Node2D" parent="." unique_id=1314316972]
+
+[node name="SimulationLayer" type="Node2D" parent="WorldLayer" unique_id=1013842152]
+script = ExtResource("2_sim")
+curve_height = null
+
+[node name="OriginMarker" type="Marker2D" parent="WorldLayer/SimulationLayer" unique_id=647853160]
+unique_name_in_owner = true
+position = Vector2(520, 690)
+
+[node name="DestMarker" type="Marker2D" parent="WorldLayer/SimulationLayer" unique_id=716182415]
+unique_name_in_owner = true
+position = Vector2(1480, 360)
+
+[node name="FlightCamera" type="Camera2D" parent="WorldLayer/SimulationLayer" unique_id=1518455146]
+unique_name_in_owner = true
+position = Vector2(960, 540)
+
+[node name="UILayer" type="CanvasLayer" parent="." unique_id=420255639]
+
+[node name="UIRoot" type="Control" parent="UILayer" unique_id=1812150110]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="SafeArea" type="MarginContainer" parent="UILayer/UIRoot" unique_id=385376259]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="RootVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea" unique_id=814737753]
+layout_mode = 2
+theme_override_constants/separation = 0
+
+[node name="TopBar" type="HBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox" unique_id=141250166]
+custom_minimum_size = Vector2(0, 120)
+layout_mode = 2
+theme_override_constants/separation = 0
+
+[node name="TitleBlock" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar" unique_id=706491272]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(360, 0)
+layout_mode = 2
+
+[node name="TitleVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/TitleBlock" unique_id=559912468]
+layout_mode = 2
+
+[node name="TitleLabel" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/TitleBlock/TitleVBox" unique_id=915443612]
+unique_name_in_owner = true
+layout_mode = 2
+text = "AIRFREIGHT LOGISTICS SIMULATION"
+
+[node name="SubtitleLabel" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/TitleBlock/TitleVBox" unique_id=1642130296]
+unique_name_in_owner = true
+layout_mode = 2
+text = "DISCRETE-EVENT SIMULATION"
+
+[node name="StatsStrip" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar" unique_id=262358538]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="DashboardRow" type="HBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip" unique_id=1693534968]
+layout_mode = 2
+theme_override_constants/separation = 16
+
+[node name="CardGenerated" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow" unique_id=1337364062]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="CardGeneratedVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardGenerated" unique_id=875192306]
+layout_mode = 2
+
+[node name="LabelGeneratedTitle" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardGenerated/CardGeneratedVBox" unique_id=123391839]
+visible = false
+layout_mode = 2
+text = "GENERATED"
+
+[node name="GeneratedTitleRow" type="HBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardGenerated/CardGeneratedVBox" unique_id=480105845]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="GeneratedIcon" type="TextureRect" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardGenerated/CardGeneratedVBox/GeneratedTitleRow" unique_id=383133996]
+custom_minimum_size = Vector2(48, 48)
+layout_mode = 2
+texture = ExtResource("3_icon_gen")
+expand_mode = 1
+stretch_mode = 5
+
+[node name="GeneratedTitleWithIcon" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardGenerated/CardGeneratedVBox/GeneratedTitleRow" unique_id=829521019]
+layout_mode = 2
+text = "GENERATED"
+vertical_alignment = 1
+
+[node name="LabelGeneratedValue" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardGenerated/CardGeneratedVBox" unique_id=995239329]
+unique_name_in_owner = true
+layout_mode = 2
+text = "0"
+
+[node name="CardQueued" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow" unique_id=1378776206]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="CardQueuedVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardQueued" unique_id=258069965]
+layout_mode = 2
+
+[node name="LabelQueuedTitle" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardQueued/CardQueuedVBox" unique_id=936158882]
+visible = false
+layout_mode = 2
+text = "IN QUEUE"
+
+[node name="QueuedTitleRow" type="HBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardQueued/CardQueuedVBox" unique_id=1664813384]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="QueuedIcon" type="TextureRect" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardQueued/CardQueuedVBox/QueuedTitleRow" unique_id=662257102]
+custom_minimum_size = Vector2(48, 48)
+layout_mode = 2
+texture = ExtResource("4_icon_queue")
+expand_mode = 1
+stretch_mode = 5
+
+[node name="QueuedTitleWithIcon" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardQueued/CardQueuedVBox/QueuedTitleRow" unique_id=2038638721]
+layout_mode = 2
+text = "IN QUEUE"
+vertical_alignment = 1
+
+[node name="LabelQueuedValue" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardQueued/CardQueuedVBox" unique_id=1492051972]
+unique_name_in_owner = true
+layout_mode = 2
+text = "0"
+
+[node name="CardDelivered" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow" unique_id=1299905560]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="CardDeliveredVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardDelivered" unique_id=717033678]
+layout_mode = 2
+
+[node name="LabelDeliveredTitle" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardDelivered/CardDeliveredVBox" unique_id=1099711697]
+visible = false
+layout_mode = 2
+text = "DELIVERED"
+
+[node name="DeliveredTitleRow" type="HBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardDelivered/CardDeliveredVBox" unique_id=1121620510]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="DeliveredIcon" type="TextureRect" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardDelivered/CardDeliveredVBox/DeliveredTitleRow" unique_id=1660979575]
+custom_minimum_size = Vector2(48, 48)
+layout_mode = 2
+texture = ExtResource("5_icon_delivered")
+expand_mode = 1
+stretch_mode = 5
+
+[node name="DeliveredTitleWithIcon" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardDelivered/CardDeliveredVBox/DeliveredTitleRow" unique_id=1003568664]
+layout_mode = 2
+text = "DELIVERED"
+vertical_alignment = 1
+
+[node name="LabelDeliveredValue" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardDelivered/CardDeliveredVBox" unique_id=93956597]
+unique_name_in_owner = true
+layout_mode = 2
+text = "0"
+
+[node name="CardExpired" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow" unique_id=403102568]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="CardExpiredVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardExpired" unique_id=1017140291]
+layout_mode = 2
+
+[node name="LabelExpiredTitle" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardExpired/CardExpiredVBox" unique_id=1210363985]
+visible = false
+layout_mode = 2
+text = "EXPIRED"
+
+[node name="ExpiredTitleRow" type="HBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardExpired/CardExpiredVBox" unique_id=1213261329]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="ExpiredIcon" type="TextureRect" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardExpired/CardExpiredVBox/ExpiredTitleRow" unique_id=1159604658]
+custom_minimum_size = Vector2(48, 48)
+layout_mode = 2
+texture = ExtResource("6_icon_expired")
+expand_mode = 1
+stretch_mode = 5
+
+[node name="ExpiredTitleWithIcon" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardExpired/CardExpiredVBox/ExpiredTitleRow" unique_id=537768872]
+layout_mode = 2
+text = "EXPIRED"
+vertical_alignment = 1
+
+[node name="LabelExpiredValue" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/TopBar/StatsStrip/DashboardRow/CardExpired/CardExpiredVBox" unique_id=876282112]
+unique_name_in_owner = true
+layout_mode = 2
+text = "0"
+
+[node name="CenterArea" type="HBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox" unique_id=1919002676]
+layout_mode = 2
+size_flags_vertical = 3
+theme_override_constants/separation = 0
+
+[node name="OriginColumn" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea" unique_id=1001062838]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(360, 0)
+layout_mode = 2
+
+[node name="OriginVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn" unique_id=355637969]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="OriginTitle" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox" unique_id=571847141]
+layout_mode = 2
+text = "Loading Queue (FIFO)"
+
+[node name="QueueScroll" type="ScrollContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox" unique_id=120776212]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="QueueList" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/QueueScroll" unique_id=872840215]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/separation = 6
+
+[node name="FleetCoordinatorPanel" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox" unique_id=1632493036]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 170)
+layout_mode = 2
+
+[node name="FleetCoordinatorVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel" unique_id=1805061287]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="FleetCoordinatorTitle" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox" unique_id=883395874]
+layout_mode = 2
+text = "Fleet Coordinator"
+
+[node name="Aircraft1Card" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox" unique_id=1574088205]
+unique_name_in_owner = true
+layout_mode = 2
+
+[node name="Aircraft1CardVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox/Aircraft1Card" unique_id=1787710823]
+layout_mode = 2
+theme_override_constants/separation = 2
+
+[node name="Aircraft1Title" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox/Aircraft1Card/Aircraft1CardVBox" unique_id=1068283593]
+layout_mode = 2
+text = "Aircraft-1"
+
+[node name="Aircraft1StateLabel" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox/Aircraft1Card/Aircraft1CardVBox" unique_id=1382617611]
+unique_name_in_owner = true
+layout_mode = 2
+text = "State: IDLE"
+
+[node name="Aircraft1CargoLabel" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox/Aircraft1Card/Aircraft1CardVBox" unique_id=465198185]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Cargo: -"
+
+[node name="Aircraft2Card" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox" unique_id=1613932571]
+unique_name_in_owner = true
+layout_mode = 2
+
+[node name="Aircraft2CardVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox/Aircraft2Card" unique_id=1760912660]
+layout_mode = 2
+theme_override_constants/separation = 2
+
+[node name="Aircraft2Title" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox/Aircraft2Card/Aircraft2CardVBox" unique_id=84185544]
+layout_mode = 2
+text = "Aircraft-2"
+
+[node name="Aircraft2StateLabel" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox/Aircraft2Card/Aircraft2CardVBox" unique_id=2145960426]
+unique_name_in_owner = true
+layout_mode = 2
+text = "State: IDLE"
+
+[node name="Aircraft2CargoLabel" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/OriginColumn/OriginVBox/FleetCoordinatorPanel/FleetCoordinatorVBox/Aircraft2Card/Aircraft2CardVBox" unique_id=1827480834]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Cargo: -"
+
+[node name="StageViewport" type="Control" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea" unique_id=1976801166]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+mouse_filter = 2
+
+[node name="DestinationColumn" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea" unique_id=1288741647]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(360, 0)
+layout_mode = 2
+
+[node name="DestinationVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/DestinationColumn" unique_id=699684774]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="DeliveredTitle" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/DestinationColumn/DestinationVBox" unique_id=1156568975]
+layout_mode = 2
+text = "Delivered Pallets"
+
+[node name="DeliveredScroll" type="ScrollContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/DestinationColumn/DestinationVBox" unique_id=2030777655]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="DeliveredList" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/CenterArea/DestinationColumn/DestinationVBox/DeliveredScroll" unique_id=300164627]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/separation = 6
+
+[node name="BottomPanel" type="HBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox" unique_id=693799875]
+custom_minimum_size = Vector2(0, 230)
+layout_mode = 2
+theme_override_constants/separation = 0
+
+[node name="EventLogPanel" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/BottomPanel" unique_id=121470941]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="EventLogVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/BottomPanel/EventLogPanel" unique_id=835852259]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="EventLogTitle" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/BottomPanel/EventLogPanel/EventLogVBox" unique_id=1898380934]
+layout_mode = 2
+text = "Event Log"
+
+[node name="EventLogText" type="RichTextLabel" parent="UILayer/UIRoot/SafeArea/RootVBox/BottomPanel/EventLogPanel/EventLogVBox" unique_id=1131803649]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="SystemInfoPanel" type="PanelContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/BottomPanel" unique_id=1450740628]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(420, 0)
+layout_mode = 2
+
+[node name="SystemInfoVBox" type="VBoxContainer" parent="UILayer/UIRoot/SafeArea/RootVBox/BottomPanel/SystemInfoPanel" unique_id=1525082622]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="SystemInfoTitle" type="Label" parent="UILayer/UIRoot/SafeArea/RootVBox/BottomPanel/SystemInfoPanel/SystemInfoVBox" unique_id=1893854116]
+layout_mode = 2
+text = "System Metrics"
+
+[node name="SystemInfoText" type="RichTextLabel" parent="UILayer/UIRoot/SafeArea/RootVBox/BottomPanel/SystemInfoPanel/SystemInfoVBox" unique_id=1215906356]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_vertical = 3

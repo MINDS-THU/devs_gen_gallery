@@ -1,0 +1,476 @@
+[
+  {
+    "class_name": "PVVerificationEmitter",
+    "file_path": "iobs_model/devs_project/IOBS_D1_libs/PV1_libs/PVVerificationEmitter.py",
+    "logic_path": "IOBS_D1.PV1.PVVerificationEmitter",
+    "specification": {
+      "function": "Owns PV1 password-attempt stochastic verification output, logs verification results, and forwards completion requests to BPM.\n\nState machine:\n- Phase IDLE (sigma=inf): Passive. Waits for one or more completion messages on input port `service_done_in`. Produces no output.\n- Phase EMIT (sigma=0): Immediately outputs all buffered requests to output port `to_bpm` (unchanged) in `lambdaf`, then transitions back to IDLE in `deltint`.\n\nExternal transition (`deltext(e)`):\n- For each incoming request dict in `service_done_in.values` received at current sim time t:\n  1) Sample `attempts` from a Geometric distribution with success probability p = `attempt_success_p` (hardcoded to 0.5). The sampled value is the number of Bernoulli(p) trials until first success, minimum 1.\n  2) Immediately log a PV1 verification event at time t.\n  3) Append the request dict (unchanged) to an internal forward buffer.\n- If buffer is non-empty, schedule immediate emission by `hold_in('EMIT', 0.0)`.\n- Otherwise, remain in the current phase with adjusted remaining time (`ta() - e`), floored at 0.\n\nOutput function (`lambdaf`):\n- If in EMIT, send each buffered request dict out on `to_bpm`.\n\nInternal transition (`deltint`):\n- If in EMIT, clear buffer and go to IDLE (passive).\n- Otherwise, go to IDLE.\n\nInitialization (`initialize`): clears forward buffer and sets IDLE/passive.\n\nProtocol summary:\n- Start: IDLE at T=0 with empty buffer.\n- Receive: on `service_done_in` at time t, log result and queue request.\n- Send: immediately (sigma=0) forward queued requests to BPM via `to_bpm`.\n- End: no special termination behavior; `exit()` emits no logs.",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nEmitted logs:\n- On each received `service_done_in` message (in `deltext`), emits an INFO log with `log_type='RESULT'`.\n\nLog message structure (dict payload):\n{\n  \"time\": <float>  # float(get_current_time())\n  \"model\": \"PV1\",\n  \"event\": \"verification\",\n  \"data\": {\n    \"success\": 1,\n    \"attempts\": <int>  # geometric sample, k>=1\n  }\n}\n\nNo other logs are produced; `exit()` explicitly states no final logs.",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name passed to Atomic superclass; used to identify the model instance in the simulation."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to parent coupled model, or None if this is a root model. Stored as `self.parent` and not otherwise used internally."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "service_done_in",
+          "type": "dict",
+          "structure": "Completion message carrying login request. Expected keys:\n- valid (int): compatibility field; always 1.\n- invalid (int): 0 for valid login, 1 for invalid login.",
+          "protocol": {
+            "initial_state": "Model starts in phase IDLE (passive) at T=0 waiting for completion messages.",
+            "initial_signal": "No initial signal/message.",
+            "description": "On receipt at time t: for each message, sample attempts ~ Geometric(p=0.5), log PV1.verification at time t, buffer the request for forwarding, then schedule immediate output (sigma=0) by entering EMIT if any buffered."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "to_bpm",
+          "type": "dict",
+          "structure": "Forwarded request dict to BPM, unchanged from input. Expected keys:\n- valid (int): always 1.\n- invalid (int): 0 or 1.",
+          "protocol": {
+            "initial_state": "Empty; no message in transit at T=0.",
+            "initial_signal": "No initial signal/message.",
+            "description": "After receiving `service_done_in` at time t, forwards the same request(s) immediately (sigma=0) when in EMIT. One output per buffered request."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "PVServiceController",
+    "file_path": "iobs_model/devs_project/IOBS_D1_libs/PV1_libs/PVServiceController.py",
+    "logic_path": "IOBS_D1.PV1.PVServiceController",
+    "specification": {
+      "function": "Owns a single-server, FIFO-queue service controller with fixed service time.\n\nBehavior / state machine:\n- Phases: IDLE and BUSY.\n  - IDLE: sigma=inf. No request in service. On external arrivals, enqueue cleaned requests. If queue becomes non-empty, immediately start service (transition to BUSY with sigma=processing_delay).\n  - BUSY: exactly one request is in service. When sigma expires, the model outputs the completion message (same payload as the started request) on `service_done` in `lambdaf`, then in `deltint` clears current request and:\n    - if queue non-empty, immediately starts next request (remains BUSY with sigma=processing_delay),\n    - else returns to IDLE (sigma=inf).\n\nExternal transition (deltext):\n- For each message on `request_in`, the model enqueues a cleaned dict with only keys `valid` and `invalid` coerced to ints.\n- If currently IDLE, it attempts to start service immediately (no extra delay).\n- If currently BUSY, it keeps working and updates remaining time: remaining = max(ta() - e, 0), stays BUSY with updated sigma.\n\nOutput function (lambdaf):\n- If in BUSY and a completion payload was prepared, emits one dict on `service_done` containing `valid` and `invalid` (ints) copied from the request that started service.\n\nInternal helper:\n- `_start_next_service_if_possible()` pops FIFO from queue (only when no current request), prepares `_out_service_done` from the popped request, and schedules BUSY for exactly `processing_delay`.\n\nTermination (exit):\n- Emits a final summary log entry (no port I/O).",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nLog calls: `self.logger.info(payload, log_type=...)`.\n- log_type values used: \"PROCESS\" and \"RESULT\".\n\nPayload schema (JSONL-like dict):\n- Main structure always:\n  - time: float (from `get_current_time()`)\n  - model: str (model name)\n  - event: str\n  - data: dict (event-specific)\n\nEmitted events and `data` contents:\n- PROCESS / \"created\": {processing_delay: float}\n- PROCESS / \"initialized\": {queue_size: int, phase: str}\n- PROCESS / \"enqueued\": {queue_size: int, phase: str}\n- PROCESS / \"service_start\": {request: {valid:int, invalid:int}, queue_size_after_pop: int}\n- PROCESS / \"service_end_scheduled\": {request: {valid:int, invalid:int}, completion_time: float}\n- PROCESS / \"service_completed\": {request: {valid:int, invalid:int}, queue_size: int}\n- RESULT / \"finalized\": {queue_size: int, phase: str, busy: bool}\n\nNotes:\n- Logging is optional/debug-style as described in the class docstring; however, the implementation always calls `info` at the points above.",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name used as `self.name` and logged under `model`."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. Stored as `self.parent`. If None, model is treated as a root model. Not otherwise used for logic/ports."
+        },
+        {
+          "name": "processing_delay",
+          "type": "float",
+          "structure": "Fixed service time (seconds) per request. Coerced to float and used to schedule BUSY holding time and compute a logged `completion_time`. Default 10.0."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "request_in",
+          "type": "dict",
+          "structure": "Login request message.\nRequired/used keys (others ignored):\n- valid: int (expected 1 for compatibility; defaulted to 0 if missing)\n- invalid: int (0 for valid login, 1 for invalid login; defaulted to 0 if missing)\nOn reception, each message is cleaned to {valid:int, invalid:int} and enqueued FIFO.",
+          "protocol": {
+            "initial_state": "At T=0: internal FIFO queue empty; server phase IDLE; sigma=inf.",
+            "initial_signal": "No initial signal.",
+            "description": "External arrivals may include one or multiple messages in `input['request_in'].values` during a deltext call. Each is enqueued. If phase is IDLE, service starts immediately for the head-of-line request (no extra delay) and completion is scheduled after exactly `processing_delay` seconds. If phase is BUSY, the server continues current service and remaining time is reduced by elapsed `e`."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "service_done",
+          "type": "dict",
+          "structure": "Completion message emitted at service completion.\nKeys:\n- valid: int (echoed from the request that started service)\n- invalid: int (echoed from the request that started service)\nExactly one message is emitted per completed request.",
+          "protocol": {
+            "initial_state": "At T=0: no message in transit; `_out_service_done` is None.",
+            "initial_signal": "No initial signal.",
+            "description": "On each internal service completion (end of BUSY), `lambdaf` emits one dict on `service_done` equal to the cleaned request payload prepared when service started. After output, `deltint` clears the current request and either immediately starts the next queued request (new BUSY for `processing_delay`) or goes IDLE (sigma=inf)."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "InputReader1",
+    "file_path": "iobs_model/devs_project/IOBS_D1_libs/InputReader1.py",
+    "logic_path": "IOBS_D1.InputReader1",
+    "specification": {
+      "function": "Implements the `input_reader1` pipeline stage with no processing delay.\n\nState machine / workflow:\n- Phases:\n  - IDLE (sigma=inf): waits for injected requests on input port `request_in`.\n  - FORWARD (sigma=forward_delay, hardcoded 0.0): entered immediately after at least one request arrives; outputs all buffered requests via `to_aam` at the same simulation time.\n\nExternal transition (`deltext(e)`):\n- Consumes all messages currently available on `request_in` (may be multiple at same simulation time).\n- For each incoming request dict `req`:\n  - Normalizes/extracts fields:\n    - `valid` := int(req.get(\"valid\", 1))\n    - `invalid` := int(req.get(\"invalid\", 0))\n  - Buffers normalized payload: `{ \"valid\": valid, \"invalid\": invalid }`.\n  - Logs an `input_reader1.input` event (see logging section).\n- If any messages were buffered, schedules immediate internal event by switching to phase FORWARD with sigma = `forward_delay` (0.0), and copies buffered items to `_pending_out` for use by `lambdaf`.\n- If nothing arrived, remains in current phase and reduces remaining time (`remaining = ta() - e`, floored at 0.0).\n\nOutput function (`lambdaf`):\n- Only when in phase FORWARD, outputs each dict in `_pending_out` on port `to_aam`.\n\nInternal transition (`deltint`):\n- If phase FORWARD, clears `_buffer` and `_pending_out` and returns to IDLE (sigma=inf).\n- Otherwise, also returns to IDLE.\n\nInitialization (`initialize`):\n- Clears buffers.\n- Emits required `start` log event at simulation time t=0.0.\n- Enters IDLE with sigma=inf.\n\nTermination (`exit`):\n- No additional required logs; clears buffers.",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`; emits JSON-serializable dict records via `self.logger.info(..., log_type=\"PROCESS\")`.\n\nlog_type:\n- \"PROCESS\"\n\nMessage (main dict) schema for all emitted events:\n- time (float): `float(get_current_time())`\n- model (str): always \"input_reader1\"\n- event (str): one of:\n  - \"start\": emitted in `initialize()` (required at t=0.0)\n  - \"input\": emitted for each request arrival processed in `deltext()`\n- data (dict):\n  - for event \"start\": `{}`\n  - for event \"input\": `{ \"valid\": int, \"invalid\": int }` (normalized values echoed from input/defaults)",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name passed to `super().__init__(name)`. Docstring expectation: \"input_reader1\"."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to parent coupled model; stored as `self.parent`. If None, model is treated as a root model."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "request_in",
+          "type": "dict",
+          "structure": "Injected request dict.\nExpected/used keys (others ignored):\n- valid (int-like): compatibility field; defaults to 1 if missing; converted via `int(...)`.\n- invalid (int-like): 0 for valid login, 1 for invalid login; defaults to 0 if missing; converted via `int(...)`.\nNormalized payload stored/forwarded is exactly `{ \"valid\": int, \"invalid\": int }`.",
+          "protocol": {
+            "initial_state": "Model starts in IDLE with no buffered requests (`_buffer=[]`, `_pending_out=[]`) after `initialize()`; no messages assumed at T=0.",
+            "initial_signal": "No initial input signals.",
+            "description": "On receipt of one or more `request_in` messages at simulation time t, the model logs an `event=\"input\"` record per request and schedules immediate forwarding (sigma=0.0) of the normalized payload(s) to `to_aam` at time t."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "to_aam",
+          "type": "dict",
+          "structure": "Forwarded login request dict (normalized):\n- valid (int)\n- invalid (int)\nOne output dict is emitted per received request.",
+          "protocol": {
+            "initial_state": "Empty; no message in transit at T=0. Output port produces messages only during FORWARD.",
+            "initial_signal": "No initial output signals.",
+            "description": "When in FORWARD, `lambdaf()` outputs all pending normalized payloads immediately (same simulation time as their arrival, because forward_delay=0.0). After output, internal transition clears buffers and returns to IDLE."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "ANV1",
+    "file_path": "iobs_model/devs_project/IOBS_D1_libs/ANV1.py",
+    "logic_path": "IOBS_D1.ANV1",
+    "specification": {
+      "function": "Implements an AccountNumberVerifier (ANV) as an Atomic, single-server FIFO queue with two phases:\n- IDLE: server is idle; time advance is infinity; no outputs.\n- BUSY: server processes exactly one request for a fixed `processing_delay`.\n\nWorkflow / protocol:\n1) Initialization (`initialize`): queue cleared; no current request; phase set to IDLE with ta=inf.\n2) External transition (`deltext(e)`):\n   - For each message on input port `request_in`, enqueue a cleaned request dict containing only:\n     - valid: int(req.get('valid', 1))\n     - invalid: int(req.get('invalid', 0))\n   - If currently BUSY: remain BUSY and reduce remaining service time by elapsed `e` (clamped at 0).\n   - If IDLE: immediately start service if queue non-empty.\n3) Service start (internal helper `_start_next_service_if_possible`):\n   - If idle and queue non-empty: pop next request FIFO.\n   - Sample verification outcome at service start using `random.random()` against internal probability `param['verification_pass_probability']` (hardcoded to 0.5):\n     - pass_flag = 1 if random < p else 0; fail_flag = 1 - pass_flag.\n   - Prepare completion-time output:\n     - If pass_flag==1, set `_prepared_to_pv` to the same (cleaned) request dict; else None.\n   - Enter BUSY for exactly `processing_delay` seconds.\n4) Output function (`lambdaf`):\n   - If phase is BUSY and `_prepared_to_pv` is not None, emit it on `to_pv`.\n   - No logging and no state updates occur in `lambdaf`.\n5) Internal transition (`deltint`):\n   - When BUSY completes:\n     - Log the verification result (pass/fail) at the completion time.\n     - Clear current request and prepared output and reset flags.\n   - Then, if queue non-empty, immediately start next service; otherwise return to IDLE (ta=inf).\n6) Exit (`exit`): no additional behavior.",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nEmitted logs:\n- At the completion of each BUSY service (i.e., in `deltint` when phase==\"BUSY\") it calls `self.logger.info(..., log_type=\"RESULT\")`.\n\nlog_type:\n- \"RESULT\"\n\nMain message structure (dict):\n- time (float): current simulation time from `get_current_time()`\n- model (str): `self.name` (docstring expects instance name \"ANV1\")\n- event (str): \"verification\"\n- data (dict):\n  - pass (int): 1 if verification passed else 0\n  - fail (int): 1 if verification failed else 0\n\nNo other logs are produced in this model (exit explicitly avoids additional stdout/log events).",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name string; also used in logs as the `model` field (docstring expects instance name \"ANV1\")."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. Can be None to indicate root model. Stored as `self.parent` but not otherwise used in this class."
+        },
+        {
+          "name": "processing_delay",
+          "type": "float",
+          "structure": "Fixed service time per request in seconds. Default 10.0. Cast to float and used as BUSY hold time for each request."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "request_in",
+          "type": "dict",
+          "structure": "Login request dict from AAM with keys:\n- valid (int): valid flag (expected always 1; defaulted to 1 if missing)\n- invalid (int): invalid flag (0=valid login, 1=invalid login; defaulted to 0 if missing)\nOn receipt, the model coerces both fields to int and discards any other keys before enqueuing.",
+          "protocol": {
+            "initial_state": "At T=0: FIFO queue empty; server phase IDLE; no current request.",
+            "initial_signal": "No initial signal.",
+            "description": "External input protocol: each incoming request is enqueued FIFO. If the server is IDLE and work is available, service starts immediately. If the server is BUSY, it remains BUSY and continues the current service with remaining time reduced by elapsed e."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "to_pv",
+          "type": "dict",
+          "structure": "Forwarded login request dict (same cleaned schema as input):\n- valid (int)\n- invalid (int)\nEmitted only if verification outcome for that serviced request is pass==1; otherwise no output for that completion.",
+          "protocol": {
+            "initial_state": "No pending output; output port empty.",
+            "initial_signal": "No initial signal.",
+            "description": "Emitted at BUSY completion time via `lambdaf` only when the sampled verification outcome for the current service is pass==1. At most one dict emitted per serviced request."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "AAM1",
+    "file_path": "iobs_model/devs_project/IOBS_D1_libs/AAM1.py",
+    "logic_path": "IOBS_D1.AAM1",
+    "specification": {
+      "function": "Implements the AAM (AccountAccessManager) stage as a single-server FIFO queue with two phases:\n- Initialization: queue empty; server enters IDLE with infinite time advance.\n- External input handling (deltext):\n  - For each message arriving on input port `request_in`, enqueue a normalized dict `{valid: int, invalid: int}` where missing/invalid fields default to `valid=0`, `invalid=1`.\n  - If currently IDLE, immediately start service for the head-of-line request if present.\n  - If currently BUSY, remain BUSY and update remaining service time as `ta() - e`.\n- Service start (`_start_next_service_if_possible`):\n  - If not already busy and queue non-empty, pop head-of-line request and determine completion action:\n    - If `valid==1` and `invalid==0`: prepare an output payload for `to_anv` and set completion event to `\"account_generated\"`.\n    - Otherwise: prepare no output and set completion event to `\"logout\"`.\n  - Enter BUSY for a fixed `processing_delay`.\n- Output generation (lambdaf):\n  - Only on BUSY completion, if a prepared payload exists, emit it on `to_anv`.\n- Internal transition on service completion (deltint):\n  - Update KPIs: increment processed; increment forwarded if account_generated else increment logout.\n  - Emit a required completion log event (`account_generated` or `logout`) at the current simulation time.\n  - Clear current job and prepared payloads.\n  - Immediately start next queued request if any; otherwise return to IDLE (infinite wait).\n- Exit: emit a final `model_exit` log with KPI totals.\n\nCommunication protocol summary:\n- Start: model begins in IDLE; processing starts upon first arrival if queue becomes non-empty.\n- Receive: enqueue all incoming `request_in` messages.\n- Send: `to_anv` is emitted only at service completion and only for requests with `valid==1` and `invalid==0`.\n- End: no explicit termination protocol; `exit()` logs summary KPIs.",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nAll logs are sent via `self.logger.info(payload, log_type=...)` where payload is a dict with keys: `time` (float), `model` (str), `event` (str), `data` (dict).\n\nLog types and payload structures:\n- PROCESS (lifecycle/debug):\n  - model_created: {\"time\": <float>, \"model\": <str>, \"event\": \"model_created\", \"data\": {\"processing_delay\": <float>}}\n  - model_initialized: {\"time\": <float>, \"model\": <str>, \"event\": \"model_initialized\", \"data\": {\"processing_delay\": <float>}}\n- RESULT (required completion + final summary):\n  - completion event at each service completion:\n    - account_generated OR logout:\n      {\"time\": <float>, \"model\": \"AAM1\" (actually `self.name`), \"event\": \"account_generated\"|\"logout\", \"data\": {}}\n  - model_exit summary:\n    {\"time\": <float>, \"model\": <str>, \"event\": \"model_exit\", \"data\": {\"processed_total\": <int>, \"forwarded_total\": <int>, \"logout_total\": <int>}}\n\nTime source: `get_current_time()` cast to float.",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name; used in logs as the `model` field (via `self.name`)."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference; stored as `self.parent` but not otherwise used in logic. Use None if this is a root model."
+        },
+        {
+          "name": "processing_delay",
+          "type": "float",
+          "structure": "Fixed service time per request in seconds. Cast to float and used as the BUSY holding time for each serviced request."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "request_in",
+          "type": "dict",
+          "structure": "Login request dict normalized on receipt.\nExpected/used keys:\n- valid (int): expected 1 for a valid-format request; missing defaults to 0.\n- invalid (int): 0 for valid login, 1 for invalid login; missing defaults to 1.\nAny non-dict message is treated as invalid (valid=0, invalid=1).\nEach arrival is enqueued as a separate FIFO job.",
+          "protocol": {
+            "initial_state": "At T=0 queue is empty and server is IDLE (infinite time advance).",
+            "initial_signal": "No initial input signal required.",
+            "description": "On each external transition, all values present on `request_in` are enqueued (FIFO). If the model is IDLE it immediately starts service of the head-of-line request. If already BUSY, it keeps processing current job and the remaining time is reduced by elapsed `e`."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "to_anv",
+          "type": "dict",
+          "structure": "Forwarded login request dict for valid logins only.\nKeys:\n- valid (int): echoed from the current request (will be 1).\n- invalid (int): echoed from the current request (will be 0 for forwarded messages).\nNo message is emitted for invalid logins (invalid==1 or valid!=1).",
+          "protocol": {
+            "initial_state": "No message in transit at T=0.",
+            "initial_signal": "No initial output signal.",
+            "description": "Emitted only at service completion (lambdaf) and only if the serviced request satisfies valid==1 and invalid==0. Otherwise, no output is produced for that completion."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "PV1",
+    "file_path": "iobs_model/devs_project/IOBS_D1_libs/PV1.py",
+    "logic_path": "IOBS_D1.PV1",
+    "specification": {
+      "function": "Implements the PV1 (PasswordVerifier) stage as a coupled DEVS model.\n\nComposition (submodels and instance names):\n- PVServiceController as instance `service_controller`: single-server FIFO queue applying a fixed service delay to incoming login requests.\n- PVVerificationEmitter as instance `verification_emitter`: upon service completion, samples geometric attempts (p=0.5), logs PV1.verification (inside that atomic model), and forwards the request to BPM.\n\nPorts and couplings (communication workflow):\n- Start/initialization: This coupled model only constructs submodels, ports, and couplings; it has no DEVS time advance/state machine of its own.\n- Receive (EIC): External `PV1.request_in` -> `service_controller.request_in`.\n- Service completion (IC): `service_controller.service_done` -> `verification_emitter.service_done_in`.\n- Forward downstream (EOC): `verification_emitter.to_bpm` -> External `PV1.to_bpm`.\n\nProtocol summary at container level:\n- On each incoming `request_in` message, PV1 routes it to the service controller.\n- After the fixed service delay, the service controller emits a completion which is routed to the verification emitter.\n- The verification emitter immediately forwards the same request to `to_bpm` (no additional delay) and performs its own result logging (handled in its model).",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nThis coupled model emits exactly one construction-time log entry:\n- level/method: `self.logger.info(payload, log_type='PROCESS')`\n- log_type: \"PROCESS\"\n\nPayload structure (dict):\n{\n  \"time\": float,            # float(get_current_time())\n  \"model\": str,             # str(self.name)\n  \"event\": \"created\",\n  \"data\": {\n    \"processing_delay\": float,\n    \"submodels\": {\n      \"service_controller\": str,      # instance name (\"service_controller\")\n      \"verification_emitter\": str     # instance name (\"verification_emitter\")\n    }\n  }\n}\n\nNotes:\n- No other logs are produced by PV1; verification/result logs are produced by the PVVerificationEmitter submodel (not included here).",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique name for this coupled model instance; used as `self.name` and included in the creation log under `model`."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Reference to parent coupled model; stored as `self.parent`. If None, PV1 is a root model. Not otherwise used for couplings/logic."
+        },
+        {
+          "name": "processing_delay",
+          "type": "float",
+          "structure": "Fixed service time in seconds per request; passed to submodel `PVServiceController(processing_delay=float(processing_delay))` and logged in the creation log. Default 10.0."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "request_in",
+          "type": "dict",
+          "structure": "Login request entering PV1 from upstream.\nExpected keys:\n- valid: int (compatibility flag; typically 1)\n- invalid: int (0 for valid login, 1 for invalid login)\nOther keys, if present, are not used by PV1 (submodels may ignore/clean as specified in their own definitions).",
+          "protocol": {
+            "initial_state": "At T=0, PV1 is constructed with couplings in place; no internal state machine. Submodels are instantiated: `service_controller` and `verification_emitter`.",
+            "initial_signal": "No initial signal.",
+            "description": "Any message arriving on `request_in` is routed via EIC directly to `service_controller.request_in` for FIFO queuing and service. PV1 itself does not transform the message."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "to_bpm",
+          "type": "dict",
+          "structure": "Forwarded login request leaving PV1 to downstream (BPM), unchanged.\nExpected keys:\n- valid: int\n- invalid: int (0 or 1)",
+          "protocol": {
+            "initial_state": "No initial message; output is produced only in response to upstream requests after internal processing in submodels.",
+            "initial_signal": "No initial signal.",
+            "description": "Produced by EOC from `verification_emitter.to_bpm` to `PV1.to_bpm`. Emission occurs immediately after PV service completion/verification emitter forwarding (i.e., no added delay at the PV1 boundary)."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "TPM1",
+    "file_path": "iobs_model/devs_project/IOBS_D1_libs/TPM1.py",
+    "logic_path": "IOBS_D1.TPM1",
+    "specification": {
+      "function": "Implements an Atomic DEVS TransactionProcessManager (TPM) that owns the authoritative account balance and processes transaction requests with a single-server FIFO queue.\n\nCore behavior / phases:\n- INIT_PUBLISH: On initialize(), prepares an output of the initial balance and schedules an internal event at T=0 via hold_in(\"INIT_PUBLISH\", 0.0). In lambdaf(), publishes `balance_out = initial_balance`. In deltint(), clears pending output and then:\n  - if queue non-empty: starts service immediately (transitions to BUSY for `processing_delay`)\n  - else: transitions to IDLE (sigma=inf)\n- IDLE: Server is idle (sigma=inf). On external input (deltext), enqueues valid requests; if IDLE it immediately starts next request if available.\n- BUSY: Server is processing the current request for a fixed `processing_delay`. On entry to BUSY, it computes remaining balance for the in-service request as `balance - amount`, stores it as `_service_remaining`, and prepares `_out_balance_value` for output at completion.\n  - At completion: lambdaf() outputs `balance_out = remaining`.\n  - Then deltint() commits the state update: `balance = remaining`, increments `transaction_count`, emits the required RESULT log event \"transaction\", clears job markers, and immediately starts the next queued request if any; otherwise goes to IDLE.\n\nRequest handling / validation:\n- deltext(e): reads all messages on `request_in` and enqueues each valid request as {\"amount\": int}. Invalid schemas trigger an ERROR log and are ignored.\n- While BUSY, new requests only increase the FIFO queue; the current service is not preempted.\n\nCommunication protocol summary:\n- Start: initialize schedules INIT_PUBLISH at T=0.\n- Send: outputs balance snapshots on `balance_out` at T=0 and after each completed transaction.\n- Receive: accepts dict requests on `request_in` (expects key `amount` as int), enqueues FIFO.\n- End: on exit(), logs a final RESULT summary; no explicit termination signaling via ports.",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`; logging is done via `self.logger.info(payload_dict, log_type=...)`. Payload is JSON-serializable dicts.\n\nEmitted log events (from this model only):\n- log_type=\"PROCESS\" (optional debug)\n  - event=\"created\" in __init__\n    msg structure: {time: float, model: str, event: \"created\", data: {processing_delay: float, initial_balance: int, queue_discipline: str}}\n  - event=\"initialized\" in initialize()\n    msg structure: {time: float, model: str, event: \"initialized\", data: {balance: int, transaction_count: int}}\n- log_type=\"RESULT\"\n  - event=\"transaction\" (required) in deltint() upon BUSY completion\n    msg structure: {time: float, model: str, event: \"transaction\", data: {remaining: int, count: int}}\n  - event=\"final\" (optional) in exit()\n    msg structure: {time: float, model: str, event: \"final\", data: {remaining: int, count: int, queue_size: int}}\n- log_type=\"ERROR\" (optional)\n  - event=\"error\" in deltext() when request schema invalid\n    msg structure: {time: float, model: str, event: \"error\", data: {reason: \"invalid_request_schema\", expected: {amount: \"int\"}}}\n\nFields:\n- time uses `float(get_current_time())` (simulation time).\n- model is `str(self.name)`.\n- event is a short string as listed above.\n- data is an event-specific dict.",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model name used in logs and DEVS model identification."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference; may be None for a root model. Stored as `self.parent` but not otherwise used in internal logic."
+        },
+        {
+          "name": "processing_delay",
+          "type": "float",
+          "structure": "Fixed service time per request in simulation seconds. Converted to float and used as BUSY phase duration for each dequeued request."
+        },
+        {
+          "name": "initial_balance",
+          "type": "int",
+          "structure": "Initial authoritative account balance. Converted to int; published at T=0 and used to initialize internal `balance`."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "request_in",
+          "type": "dict",
+          "structure": "Transaction request message.\nExpected dict schema: {\"amount\": int} where amount is the bill amount to deduct from current balance.\nInvalid messages (non-dict, missing \"amount\", or non-int amount) are ignored and produce an ERROR log.",
+          "protocol": {
+            "initial_state": "At initialize(): FIFO queue empty; server schedules INIT_PUBLISH at T=0; then IDLE (sigma=inf) unless queued jobs exist.",
+            "initial_signal": "No signal is sent on this input port by the model.",
+            "description": "External arrivals are accepted at any time; all received messages are enqueued FIFO. If the model is IDLE when a request arrives, it starts service immediately. If BUSY, the current job continues and new arrivals wait in the queue. If INIT_PUBLISH is pending, it is preserved to publish initial balance first at T=0."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "balance_out",
+          "type": "int",
+          "structure": "Single integer snapshot of the authoritative balance.\n- At T=0: initial_balance\n- After each completed transaction: remaining balance after deduction",
+          "protocol": {
+            "initial_state": "No credits/tokens. Output is produced only during lambdaf when phase is INIT_PUBLISH or BUSY and an output value is prepared.",
+            "initial_signal": "At T=0 (via INIT_PUBLISH), emits `initial_balance`.",
+            "description": "Publishes one balance snapshot at initialization (T=0) and one after each transaction completion. No output during IDLE. Output value is prepared on entering INIT_PUBLISH (initial balance) and when starting a BUSY service (computed remaining balance for that request)."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "BPM1",
+    "file_path": "iobs_model/devs_project/IOBS_D1_libs/BPM1.py",
+    "logic_path": "IOBS_D1.BPM1",
+    "specification": {
+      "function": "Implements the BPM1 (BillPaymentManager) as an Atomic DEVS single-server with an internal FIFO queue.\n\nState machine / phases:\n- IDLE (passive, sigma=inf): No current service. Waits for incoming requests on `request_in`. If queue becomes non-empty, immediately starts service.\n- BUSY (sigma=`processing_delay`): Processes exactly one request (taken from head of FIFO queue). No output during BUSY. At BUSY completion, generates a bill amount:\n  - Reads `latest_balance` snapshot (most recently received via `balance_in`, or initialized from `initial_balance_snapshot`). Negative values are treated as 0.\n  - Draws `raw_amount = randint(bill_min, bill_max)`.\n  - Clips: `amount = min(raw_amount, latest_balance)` if latest_balance>0 else 0.\n  - Prepares `_pending_to_tpm = {'amount': amount}` and transitions to EMIT with sigma=`emit_phase_sigma` (0.0), so EMIT occurs at the same simulation time as BUSY completion.\n- EMIT (sigma=0): `lambdaf` outputs exactly one message on `to_tpm` with the prepared payload. Then `deltint` logs the required `bill` event, increments `processed_count`, clears pending/current fields, and either:\n  - Starts next queued request (transition to BUSY for `processing_delay`), or\n  - Returns to IDLE.\n\nExternal events / queueing:\n- On `balance_in`: updates `latest_balance` for each received value (cast to int; malformed values are ignored and previous balance is retained).\n- On `request_in`: enqueues each received dict request into the FIFO queue.\n- If currently IDLE and queue becomes non-empty: starts BUSY immediately.\n- If currently BUSY or EMIT: stays in same phase and adjusts remaining time: `remaining = ta() - e` (floored at 0).\n\nConfluent behavior (deltcon): processes external events first (`deltext(0.0)`) and then internal transition (`deltint()`), ensuring a balance update arriving at the same simulation time as service completion is applied before bill generation/clipping.\n\nPorts are intended to connect to sibling models per docstring:\n- `request_in` from [Sibling-PV1: to_bpm]\n- `balance_in` from [Sibling-TPM1: balance_out]\n- `to_tpm` to [Sibling-TPM1: request_in]",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nAll logs are JSON-serializable dict messages written via `self.logger.info(msg, log_type=...)`.\n\nEvents:\n- bill (REQUIRED)\n  - When: in `deltint` during EMIT phase (immediately after BUSY completion; same simulation time t).\n  - log_type: \"RESULT\"\n  - Message schema:\n    {\n      'time': float,              # get_current_time()\n      'model': str,               # self.name\n      'event': 'bill',\n      'data': {\n        'amount': int             # generated bill amount (0..bill_max) clipped by latest_balance\n      }\n    }\n- created (optional debug)\n  - When: end of `__init__`.\n  - log_type: \"PROCESS\"\n  - Message schema: {time, model, event:'created', data:{processing_delay:float, bill_min:int, bill_max:int, initial_balance_snapshot:int}}\n- initialized (optional debug)\n  - When: in `initialize()`.\n  - log_type: \"PROCESS\"\n  - Message schema: {time, model, event:'initialized', data:{latest_balance:int, queue_size:int, phase:'IDLE'}}\n- finished (optional debug)\n  - When: in `exit()`.\n  - log_type: \"RESULT\"\n  - Message schema: {time, model, event:'finished', data:{processed_count:int}}",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique model instance name; also emitted in logs as `model`."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. May be None for a root model. Stored as `self.parent` and not otherwise used in internal logic."
+        },
+        {
+          "name": "processing_delay",
+          "type": "float",
+          "structure": "Fixed service time (sigma) in seconds for BUSY phase per processed request. Default 10.0. Cast to float."
+        },
+        {
+          "name": "bill_min",
+          "type": "int",
+          "structure": "Inclusive minimum for random bill generation (`randint(bill_min, bill_max)`). Default 0. Cast to int."
+        },
+        {
+          "name": "bill_max",
+          "type": "int",
+          "structure": "Inclusive maximum for random bill generation before clipping by balance. Default 40. Cast to int."
+        },
+        {
+          "name": "initial_balance_snapshot",
+          "type": "int",
+          "structure": "Initial `latest_balance` used for clipping until `balance_in` updates arrive. Default 3000. Cast to int."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "request_in",
+          "type": "dict",
+          "structure": "Each message is expected to be a dict with keys:\n- valid (int): expected 1 (compatibility)\n- invalid (int): 0 for valid login, 1 for invalid login\nModel behavior: if the received value is a dict, it is appended to the internal FIFO queue; the content is not otherwise inspected.",
+          "protocol": {
+            "initial_state": "At T=0: internal FIFO queue empty; server in IDLE with sigma=inf.",
+            "initial_signal": "No initial input signals produced by this model (input-only port).",
+            "description": "Process: on reception, enqueue requests (FIFO). If phase==IDLE and no current request, immediately start BUSY for `processing_delay` using the oldest queued request."
+          }
+        },
+        {
+          "name": "balance_in",
+          "type": "int",
+          "structure": "Each message is an integer balance snapshot (expected non-negative). Negative values are tolerated but treated as 0 when clipping at bill generation. Malformed (non-castable) values are ignored.",
+          "protocol": {
+            "initial_state": "At T=0: `latest_balance` initialized to `initial_balance_snapshot`.",
+            "initial_signal": "No initial input signals produced by this model (input-only port).",
+            "description": "Process: on reception, update `latest_balance = int(value)` for each received value. If a balance update arrives at the same time as service completion, confluent transition applies the update before bill generation/clipping."
+          }
+        }
+      ],
+      "output_ports": [
+        {
+          "name": "to_tpm",
+          "type": "dict",
+          "structure": "Each output message is a dict:\n- amount (int): generated bill amount after clipping by `latest_balance` at service completion time.",
+          "protocol": {
+            "initial_state": "No initial outputs.",
+            "initial_signal": "None.",
+            "description": "On each completed request: after BUSY completion, transition to EMIT with sigma=0 and output exactly one message on `to_tpm` (same simulation time as BUSY completion)."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "class_name": "IOBS_D1",
+    "file_path": "iobs_model/devs_project/IOBS_D1.py",
+    "logic_path": "IOBS_D1",
+    "specification": {
+      "function": "Implements the full Internet Online Banking System (IOBS) pipeline as a coupled DEVS container. The coupled model itself has no internal DEVS state machine; it defines system boundary ports, instantiates submodels, and connects them via couplings.\n\nPipeline (submodel class -> instance name) as constructed in `__init__`:\n- InputReader1 -> `input_reader1`\n- AAM1 -> `AAM1`\n- ANV1 -> `ANV1`\n- PV1 -> `PV1`\n- BPM1 -> `BPM1`\n- TPM1 -> `TPM1`\n\nSystem-level communication workflow / protocol:\n- Receive (EIC): external port `request_in` routes injected login request dicts to `input_reader1.request_in`.\n- Internal pipeline routing (IC):\n  - `input_reader1.to_aam` -> `AAM1.request_in`\n  - `AAM1.to_anv` -> `ANV1.request_in`\n  - `ANV1.to_pv` -> `PV1.request_in`\n  - `PV1.to_bpm` -> `BPM1.request_in`\n  - `BPM1.to_tpm` -> `TPM1.request_in`\n- Balance feedback loop (IC): `TPM1.balance_out` -> `BPM1.balance_in` (authoritative balance snapshots inform bill clipping).\n- Send: this coupled model defines no external output ports; all outputs remain internal to the pipeline (balance and transaction effects are handled/logged by submodels).\n\nParameter propagation to submodels:\n- `processing_delay` is passed (as float) to AAM1, ANV1, PV1, BPM1, TPM1.\n- `initial_balance` is passed (as int) to TPM1 as `initial_balance` and to BPM1 as `initial_balance_snapshot`.\n- `bill_min`/`bill_max` are passed (as int) to BPM1.",
+      "logging": "Logger: `self.logger = get_sim_logger(self)`.\n\nThis coupled model emits exactly one log entry during construction (`__init__`).\n- method/level: `self.logger.info(msg_dict, log_type=\"PROCESS\")`\n- log_type: \"PROCESS\"\n\nMessage structure (dict):\n{\n  \"time\": float,                 # float(get_current_time())\n  \"model\": str,                  # str(self.name)\n  \"event\": \"created\",\n  \"data\": {\n    \"processing_delay\": float,   # float(processing_delay)\n    \"initial_balance\": int,      # int(initial_balance)\n    \"bill_min\": int,             # int(bill_min)\n    \"bill_max\": int,             # int(bill_max)\n    \"submodels\": {\n      \"input_reader1\": \"input_reader1\",\n      \"AAM1\": \"AAM1\",\n      \"ANV1\": \"ANV1\",\n      \"PV1\": \"PV1\",\n      \"BPM1\": \"BPM1\",\n      \"TPM1\": \"TPM1\"\n    }\n  }\n}\n\nNo other logging calls exist in this coupled model.",
+      "model_init_args": [
+        {
+          "name": "name",
+          "type": "str",
+          "structure": "Unique coupled-model instance name. Passed to `super().__init__(name)` and emitted in logs as `model` via `str(self.name)`."
+        },
+        {
+          "name": "parent",
+          "type": "Coupled | None",
+          "structure": "Parent coupled model reference. Stored in `self.parent`. If None, this coupled model is a root model."
+        },
+        {
+          "name": "processing_delay",
+          "type": "float",
+          "structure": "Fixed per-stage service time in seconds used for AAM1/ANV1/PV1/BPM1/TPM1. Default 10.0. Cast to float when passed to submodels and logged as float."
+        },
+        {
+          "name": "initial_balance",
+          "type": "int",
+          "structure": "Initial authoritative balance for TPM1 (passed as `initial_balance=int(initial_balance)`). Also used to seed BPM1’s clipping balance snapshot (passed as `initial_balance_snapshot=int(initial_balance)`). Default 3000. Cast to int and logged as int."
+        },
+        {
+          "name": "bill_min",
+          "type": "int",
+          "structure": "Minimum bill amount inclusive for BPM1 random generation. Default 0. Cast to int, passed to BPM1 as `bill_min`, and logged as int."
+        },
+        {
+          "name": "bill_max",
+          "type": "int",
+          "structure": "Maximum bill amount inclusive for BPM1 random generation before clipping by balance. Default 40. Cast to int, passed to BPM1 as `bill_max`, and logged as int."
+        }
+      ],
+      "input_ports": [
+        {
+          "name": "request_in",
+          "type": "dict",
+          "structure": "Injected login request entering the system.\nExpected keys (per docstring; coupled model does not transform payload):\n- valid (int): compatibility flag (expected 1)\n- invalid (int): 0 for valid login, 1 for invalid login\nOther keys, if present, are not used by this coupled model; downstream stages may normalize/ignore as defined in their own models.",
+          "protocol": {
+            "initial_state": "At T=0 the coupled model has its EIC/IC couplings configured; no initial input assumed on `request_in`.",
+            "initial_signal": "No initial input signals.",
+            "description": "Each incoming `request_in` message is routed via EIC to `input_reader1.request_in` without modification."
+          }
+        }
+      ],
+      "output_ports": []
+    }
+  }
+]

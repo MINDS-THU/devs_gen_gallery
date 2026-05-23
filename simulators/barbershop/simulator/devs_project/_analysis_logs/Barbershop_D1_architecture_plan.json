@@ -1,0 +1,200 @@
+{
+  "type": "coupled",
+  "model_info": {
+    "class_name": "Barbershop_D1",
+    "file_path": "barbershop_model/devs_project/Barbershop_D1.py",
+    "logic_path": "Barbershop_D1",
+    "specification": {
+      "function": "### Core Model: `Barbershop_D1`\n\n**Purpose**: Coupled DEVS model that simulates a barbershop workflow with three internal logical modules (instances): `reception`, `checkhair`, `cuthair`.\n\n**Time unit**: `1.0` simulation time unit = `1` second. Simulation clock starts at `0.0`.\n\n#### External behavior (what `Barbershop_D1` does)\n- Accepts external arrival events of type `\"newcust\"` at arbitrary simulation times (injected by the controller based on stdin schedule).\n- Routes each arrival event to the internal `reception` module.\n- Has no required external output ports; all required outputs are produced via structured logging by internal modules.\n\n---\n\n## Internal Modules (atomic responsibilities and rules)\n\n### 1) Module `reception`\n**Role**: Entry point; manages waiting area and check-in; hands customers to `checkhair` when possible.\n\n**State (conceptual)**\n- `queue`: FIFO queue of customers (each customer represented as the token string `\"newcust\"`).\n- `capacity = 8`: strict maximum number of customers allowed in the waiting area **including any customer currently being checked in**.\n- `checkhair_available`: boolean reflecting whether `checkhair` is currently able to accept a new customer.\n- `processing`: boolean indicating whether reception is currently in a 5-second check-in delay for the head-of-line customer.\n\n**Arrival handling**\n- On external arrival `\"newcust\"`:\n  - If `len(queue) < 8`: append `\"newcust\"` to `queue`.\n    - This changes the tracked variable **total customers num** (see logging) to the new queue length.\n    - If `processing` is false (idle), begin processing the head-of-line customer.\n  - If `len(queue) == 8`: **ignore** the arrival; no state changes.\n\n**Check-in processing (timed)**\n- Reception processes **at most 1** customer at a time.\n- When starting to process the head-of-line customer:\n  - Hold for **exactly 5.0 seconds** (check-in time).\n  - The customer **remains in `queue`** during this 5-second period.\n\n**Handoff rule after check-in**\n- After the 5.0 seconds elapse for the head-of-line customer:\n  - If `checkhair_available` is true:\n    - Send message `\"newcust\"` to `checkhair` (port name `\"cust\"` from the perspective of the sender `reception`, per required message logging).\n    - Remove that customer from the front of `queue` (decrement queue length).\n      - Update tracked variable **total customers num** to the new queue length.\n    - Immediately (no extra delay) begin processing the next head-of-line customer if `queue` is non-empty; otherwise become idle.\n  - If `checkhair_available` is false:\n    - Do **not** remove the customer.\n    - Enter a waiting/blocked state and repeatedly attempt handoff **only when** an availability notification is received from `checkhair` (see below). Processing of the next customer does not start until the current head-of-line customer is successfully handed off.\n\n**Availability notification from `checkhair`**\n- Reception receives a notification message with content `\"done\"` from `checkhair` (sent on `checkhair` port `\"to_reception\"`).\n- Upon receiving `\"done\"`:\n  - Set `checkhair_available = true`.\n  - If reception is blocked with a head-of-line customer whose 5-second check-in has already completed, perform the handoff immediately at the same simulation time (0 additional delay), then continue as per rules above.\n\n---\n\n### 2) Module `checkhair`\n**Role**: Hair inspection/consultation and coordinator between reception and cutting.\n\n**State (conceptual)**\n- `status`: one of `{available, busy_consult, waiting_cut_done}`.\n- `current_customer`: token `\"newcust\"` when in service; none when available.\n\n**Initial condition**\n- Starts in `available` state.\n\n**Receive from reception**\n- Only accepts a customer (`\"newcust\"`) when in `available`.\n- On accept:\n  - Transition to `busy_consult`.\n  - Set tracked variable **customer** to `\"newcust\"`.\n  - Hold for **exactly 7.0 seconds** (consultation time).\n\n**Forward to cutting after consultation**\n- After exactly 7.0 seconds:\n  - Send message content `\"newcust\"` to `cuthair` via port `\"to_cut\"`.\n  - Transition to `waiting_cut_done`.\n\n**Wait for cutting completion**\n- While in `waiting_cut_done`, wait for a message content `\"done\"` from `cuthair` (received from `cuthair` port `\"out\"`).\n\n**Completion and availability**\n- Upon receiving `\"done\"` from `cuthair`:\n  - Update tracked variable **customer** to `\"done\"`.\n  - Send message content `\"done\"` to `reception` via port `\"to_reception\"`.\n  - Only **after** sending this notification, transition back to `available` (able to accept the next customer).\n\n---\n\n### 3) Module `cuthair`\n**Role**: Perform hair cutting.\n\n**State (conceptual)**\n- `busy`: boolean.\n- `total_customer_done`: cumulative integer counter (starts at 0).\n\n**Receive from checkhair**\n- Accepts message content `\"newcust\"` from `checkhair`.\n- Process **exactly 20.0 seconds** (cutting time).\n\n**Completion**\n- After exactly 20.0 seconds:\n  - Increment `total_customer_done += 1`.\n  - Send message content `\"done\"` to `checkhair` via port `\"out\"`.\n\n---\n\n## Coupling (internal routing)\n- External `Barbershop_D1.in_newcust` → `reception` (arrival input).\n- `reception` → `checkhair` (message logged as sender port `\"cust\"`, content `\"newcust\"`).\n- `checkhair` → `cuthair` (sender port `\"to_cut\"`, content `\"newcust\"`).\n- `cuthair` → `checkhair` (sender port `\"out\"`, content `\"done\"`).\n- `checkhair` → `reception` (sender port `\"to_reception\"`, content `\"done\"`).\n",
+      "logging": "The core model (specifically the internal module instances `reception`, `checkhair`, `cuthair`) MUST emit JSON-serializable dict logs for stdout JSONL production by the external controller.\n\n### Log record schema (MUST match)\nEach log is one JSON object with:\n- `time`: float (current simulation time)\n- `type`: one of `\"state\"` or `\"message\"`\n- `model`: one of `\"reception\"`, `\"checkhair\"`, `\"cuthair\"`\n\n#### Type A: State Change (`type=\"state\"`)\nEmit **whenever the tracked variable changes**:\n1) Reception\n- `field`: exactly `\"total customers num\"`\n- `value`: integer current queue length (0..8)\n- Emit when a customer is accepted into the queue and when a customer is removed from the queue due to successful handoff to `checkhair`.\n\n2) Checkhair\n- `field`: exactly `\"customer\"`\n- `value`: either `\"newcust\"` (when inspection/consultation starts) or `\"done\"` (when `done` is received back from `cuthair`).\n\n3) Cuthair\n- `field`: exactly `\"total customer done\"`\n- `value`: integer cumulative number of completed haircuts\n- Emit immediately when incremented at the end of each 20s cutting completion.\n\n#### Type B: Communication Event (`type=\"message\"`)\nEmit **whenever a module sends a message to another module**:\n- `port`: must be exactly one of:\n  - From `reception`: `\"cust\"`\n  - From `checkhair`: `\"to_cut\"`, `\"to_reception\"`\n  - From `cuthair`: `\"out\"`\n- `content`: must be exactly one of `\"newcust\"` or `\"done\"`\n\n### Timing of logs\n- Message logs MUST use the simulation time at which the send occurs.\n- State logs MUST use the simulation time at which the state variable is updated.\n\nNo additional stdout writing is done by the core model; only logger events are produced.",
+      "model_init_args": [],
+      "input_ports": [
+        {
+          "name": "in_newcust",
+          "type": "str",
+          "structure": "Arrival token. Must be the literal string 'newcust' only.",
+          "protocol": {
+            "initial_state": "None",
+            "initial_signal": "None",
+            "description": "External controller injects 'newcust' events at scheduled simulation times. Each event is routed to the internal reception arrival handler."
+          }
+        }
+      ],
+      "output_ports": []
+    }
+  },
+  "children_plan": [
+    {
+      "class_name": "Reception",
+      "file_path": "barbershop_model/devs_project/Barbershop_D1_libs/Reception",
+      "logic_path": "Barbershop_D1.Reception",
+      "specification": {
+        "function": "Implements the `reception` module of `Barbershop_D1`.\n\nResponsibilities (delegated from parent spec):\n- Accept external arrivals (token `\"newcust\"`) from the parent’s `in_newcust` and manage a FIFO waiting-area queue.\n- Enforce `capacity = 8` maximum customers in the waiting area, **including** any customer currently being checked in. If queue length is 8, ignore arrivals.\n- Perform check-in for at most 1 customer at a time with an **exact** delay of `5.0` seconds; the head-of-line customer remains in the queue during this delay.\n- After the 5.0s check-in completes, attempt to hand off the head-of-line customer to `checkhair` by sending `\"newcust\"`.\n  - If `checkhair` is available: send immediately, then remove customer from the front of the queue and immediately start processing the next head-of-line customer if any.\n  - If `checkhair` is not available: do not remove the customer; enter a blocked state and only retry handoff when an availability notification `\"done\"` is received from `checkhair`.\n- Maintain `checkhair_available` reflecting whether `checkhair` can accept a new customer.\n\nTime semantics:\n- Time unit is seconds (1.0 sim unit = 1 second). All holds are exactly 5.0s as specified.\n\nInitialization / deadlock avoidance:\n- Since `checkhair` starts in `available`, initialize `checkhair_available = true` at T=0 (no need for an initial message).",
+        "logging": "Must emit JSON-serializable dict logs via the provided Logger.\n\nLog record schema (MUST match exactly):\n- `time`: float (current simulation time)\n- `type`: `\"state\"` or `\"message\"`\n- `model`: must be exactly `\"reception\"`\n\nState-change logs (`type=\"state\"`): emit whenever the tracked variable changes:\n- `field`: exactly `\"total customers num\"`\n- `value`: int current queue length (0..8)\n- Emit when a customer is accepted into the queue and when a customer is removed from the queue due to successful handoff to `checkhair`.\n\nMessage logs (`type=\"message\"`): emit whenever this module sends a message:\n- When sending to `checkhair`, log:\n  - `port`: exactly `\"cust\"`\n  - `content`: exactly `\"newcust\"`\n\nTiming:\n- Use the simulation time at which the send occurs (message) or the queue length is updated (state).",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "Unique model instance name (e.g., 'reception')."
+          },
+          {
+            "name": "capacity",
+            "type": "int",
+            "structure": "Maximum number of customers allowed in the waiting area including any being checked in. Must be 8."
+          },
+          {
+            "name": "checkin_time",
+            "type": "float",
+            "structure": "Exact check-in processing time in seconds. Must be 5.0."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "in_newcust",
+            "type": "str",
+            "structure": "Arrival token. Must be the literal string 'newcust' only.",
+            "protocol": {
+              "initial_state": "Empty (no stored arrivals).",
+              "initial_signal": "None.",
+              "description": "Receives external arrival events from [Parent: in_newcust]. If queue length < 8, enqueues; if queue length == 8, ignores."
+            }
+          },
+          {
+            "name": "in_done",
+            "type": "str",
+            "structure": "Availability notification. Must be the literal string 'done' only.",
+            "protocol": {
+              "initial_state": "Empty; no pending availability notifications.",
+              "initial_signal": "None.",
+              "description": "Receives `done` notifications from [Sibling-checkhair: to_reception] indicating `checkhair` is available. If reception is blocked after completing the 5s check-in, it must attempt immediate handoff at the same simulation time."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "cust",
+            "type": "str",
+            "structure": "Customer token sent onward. Must be the literal string 'newcust' only.",
+            "protocol": {
+              "initial_state": "No pending sends.",
+              "initial_signal": "None.",
+              "description": "Sends `newcust` to [Sibling-checkhair: in_cust] only after the head-of-line completes the 5.0s check-in and `checkhair_available` is true. Each send must produce a message log with `port='cust'` and `content='newcust'` at send time."
+            }
+          }
+        ]
+      }
+    },
+    {
+      "class_name": "CheckHair",
+      "file_path": "barbershop_model/devs_project/Barbershop_D1_libs/CheckHair",
+      "logic_path": "Barbershop_D1.CheckHair",
+      "specification": {
+        "function": "Implements the `checkhair` module of `Barbershop_D1`.\n\nResponsibilities (delegated from parent spec):\n- Acts as hair inspection/consultation and coordinator between `reception` and `cuthair`.\n- State machine with `status` in `{available, busy_consult, waiting_cut_done}`.\n- Initial condition: starts `available`.\n- Accepts `\"newcust\"` only when `available`.\n  - On accept: set tracked variable **customer** to `\"newcust\"`, transition to `busy_consult`, and hold for **exactly 7.0 seconds**.\n- After exactly 7.0 seconds: send `\"newcust\"` to `cuthair` via port `to_cut`, then transition to `waiting_cut_done`.\n- While `waiting_cut_done`: wait for `\"done\"` from `cuthair`.\n- Upon receiving `\"done\"` from `cuthair`:\n  - Update tracked variable **customer** to `\"done\"`.\n  - Send `\"done\"` to `reception` via port `to_reception`.\n  - Only after sending that notification, transition back to `available`.\n\nTime semantics:\n- Time unit is seconds; consultation time is exactly 7.0s.",
+        "logging": "Must emit JSON-serializable dict logs via the provided Logger.\n\nLog record schema (MUST match exactly):\n- `time`: float (current simulation time)\n- `type`: `\"state\"` or `\"message\"`\n- `model`: must be exactly `\"checkhair\"`\n\nState-change logs (`type=\"state\"`): emit whenever the tracked variable changes:\n- `field`: exactly `\"customer\"`\n- `value`: either `\"newcust\"` (when consultation starts) or `\"done\"` (when `done` is received from `cuthair`).\n\nMessage logs (`type=\"message\"`): emit whenever this module sends a message:\n- When sending to `cuthair`:\n  - `port`: exactly `\"to_cut\"`\n  - `content`: exactly `\"newcust\"`\n- When sending to `reception`:\n  - `port`: exactly `\"to_reception\"`\n  - `content`: exactly `\"done\"`\n\nTiming:\n- Use the simulation time at which the send occurs (message) or the tracked variable is updated (state).",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "Unique model instance name (e.g., 'checkhair')."
+          },
+          {
+            "name": "consult_time",
+            "type": "float",
+            "structure": "Exact consultation time in seconds. Must be 7.0."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "in_cust",
+            "type": "str",
+            "structure": "Customer token from reception. Must be the literal string 'newcust' only.",
+            "protocol": {
+              "initial_state": "Ready to accept at T=0 because status starts `available`.",
+              "initial_signal": "None.",
+              "description": "Receives `newcust` from [Sibling-reception: cust]. Must accept only when status is `available`; otherwise cannot accept (per spec). On accept, begins 7.0s consult and emits state log `field='customer', value='newcust'`."
+            }
+          },
+          {
+            "name": "in_done",
+            "type": "str",
+            "structure": "Completion token from cutting. Must be the literal string 'done' only.",
+            "protocol": {
+              "initial_state": "Empty.",
+              "initial_signal": "None.",
+              "description": "Receives `done` from [Sibling-cuthair: out] while in `waiting_cut_done`. Upon receive, updates state log `field='customer', value='done'`, then sends `done` to reception via `to_reception` and only then transitions to `available`."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "to_cut",
+            "type": "str",
+            "structure": "Customer token forwarded to cutting. Must be the literal string 'newcust' only.",
+            "protocol": {
+              "initial_state": "No pending sends.",
+              "initial_signal": "None.",
+              "description": "After exactly 7.0s consultation completes, sends `newcust` to [Sibling-cuthair: in_newcust]. Must emit message log with `port='to_cut'`, `content='newcust'` at send time."
+            }
+          },
+          {
+            "name": "to_reception",
+            "type": "str",
+            "structure": "Availability notification. Must be the literal string 'done' only.",
+            "protocol": {
+              "initial_state": "No pending sends.",
+              "initial_signal": "None.",
+              "description": "Upon receiving `done` from [Sibling-cuthair: out], sends `done` to [Sibling-reception: in_done] to indicate availability. Must emit message log with `port='to_reception'`, `content='done'` at send time."
+            }
+          }
+        ]
+      }
+    },
+    {
+      "class_name": "CutHair",
+      "file_path": "barbershop_model/devs_project/Barbershop_D1_libs/CutHair",
+      "logic_path": "Barbershop_D1.CutHair",
+      "specification": {
+        "function": "Implements the `cuthair` module of `Barbershop_D1`.\n\nResponsibilities (delegated from parent spec):\n- Perform hair cutting for each received `\"newcust\"` from `checkhair`.\n- Processing time is **exactly 20.0 seconds** per customer.\n- Maintain cumulative counter `total_customer_done` starting at 0.\n- After exactly 20.0 seconds of cutting:\n  - Increment `total_customer_done += 1`.\n  - Emit the tracked-variable state log for `total customer done` immediately when incremented.\n  - Send message `\"done\"` to `checkhair` via port `out`.\n\nTime semantics:\n- Time unit is seconds; cutting time is exactly 20.0s.",
+        "logging": "Must emit JSON-serializable dict logs via the provided Logger.\n\nLog record schema (MUST match exactly):\n- `time`: float (current simulation time)\n- `type`: `\"state\"` or `\"message\"`\n- `model`: must be exactly `\"cuthair\"`\n\nState-change logs (`type=\"state\"`): emit whenever the tracked variable changes:\n- `field`: exactly `\"total customer done\"`\n- `value`: int cumulative number of completed haircuts\n- Emit immediately when incremented at the end of each 20s cutting completion.\n\nMessage logs (`type=\"message\"`): emit whenever this module sends a message:\n- When sending to `checkhair`:\n  - `port`: exactly `\"out\"`\n  - `content`: exactly `\"done\"`\n\nTiming:\n- Use the simulation time at which the send occurs (message) or the counter is incremented (state).",
+        "model_init_args": [
+          {
+            "name": "name",
+            "type": "str",
+            "structure": "Unique model instance name (e.g., 'cuthair')."
+          },
+          {
+            "name": "cut_time",
+            "type": "float",
+            "structure": "Exact cutting time in seconds. Must be 20.0."
+          }
+        ],
+        "input_ports": [
+          {
+            "name": "in_newcust",
+            "type": "str",
+            "structure": "Customer token from checkhair. Must be the literal string 'newcust' only.",
+            "protocol": {
+              "initial_state": "Idle; no job in service at T=0.",
+              "initial_signal": "None.",
+              "description": "Receives `newcust` from [Sibling-checkhair: to_cut]. Starts an exact 20.0s cutting hold upon receipt."
+            }
+          }
+        ],
+        "output_ports": [
+          {
+            "name": "out",
+            "type": "str",
+            "structure": "Completion token sent to checkhair. Must be the literal string 'done' only.",
+            "protocol": {
+              "initial_state": "No pending sends.",
+              "initial_signal": "None.",
+              "description": "After exactly 20.0s cutting completes, increments `total_customer_done`, emits state log `field='total customer done'`, then sends `done` to [Sibling-checkhair: in_done]. Must emit message log with `port='out'`, `content='done'` at send time."
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "coupling_specification": "Instantiate three children as instances: `reception` (class Reception), `checkhair` (class CheckHair), `cuthair` (class CutHair).\n\nExternal Input Coupling (EIC):\n- [Parent: in_newcust] -> [reception: in_newcust]\n\nInternal Couplings (IC):\n- [reception: cust] -> [checkhair: in_cust]\n- [checkhair: to_cut] -> [cuthair: in_newcust]\n- [cuthair: out] -> [checkhair: in_done]\n- [checkhair: to_reception] -> [reception: in_done]\n\nExternal Output Coupling (EOC):\n- None (parent has no output ports; all outputs are via required structured logging from the internal instances).",
+  "_context_used": "logic_path='Barbershop_D1' original_project_requirements='{\\'general\\': \\'### General Implementation Requirements\\\\n1. Language & Environment:\\\\n- Target Language: Python 3.10+\\\\n- Standard Libraries: `argparse`, `sys`, `json`, `logging`, `collections`, `random`, `simpy`, `xdevs`.\\\\n\\\\n2. Input Interface (Arguments):\\\\n- **CLI Arguments:** You MUST use the `argparse` library to handle configuration parameters.\\\\n- **Data Stream:** Read from `sys.stdin`. The simulation must consume ALL input lines from stdin to build an initial event schedule BEFORE starting the simulation loop.\\\\n\\\\n3. Output Interface:\\\\n- Stream 1: Final State (sys.stdout)\\\\n    - You MUST print ONLY JSONL objects containing the required events.\\\\n    - Schema: The objects MUST follow the structure described later. \\\\n    - Example: `print(json.dumps({...}))`\\\\n- Stream 2: Debug/Log data (sys.stderr)\\\\n    - Print any other information (debug, progress, warnings) to Standard Error.\\\\n\\\\n4. Entry point: executable via `python run.py`\\\\n\\\\nDo not use real time, use simulation time, and guarantee the simulation ends in 10 seconds in real time. \\\\n\\', \\'scenario\\': \\'### Scenario: Barbershop Business Logic & Workflow\\\\n\\\\n1. System Overview\\\\nThe system simulates a barbershop workflow consisting of three main functional areas: Reception Desk , Hair Inspection and Hair Cutting.\\\\nThe simulation must handle customer flow, queue management, and precise timing for each service stage.\\\\n\\\\n2. Functional Modules & Logic\\\\n\\\\n#### Reception Desk (Logic Name: `reception`)\\\\n* Role: Entry point for customers. Manages the waiting area.\\\\n* Queue: The waiting area has a strict capacity of 8 customers.\\\\n* Processing: 1 customer at a time, 5 seconds per customer (check-in time).\\\\n* Workflow:\\\\n    1.  **Arrival**: When a customer arrives (from input source), check the queue size.\\\\n        * If Queue < 8: Accept customer, increment queue count.\\\\n        * If Queue = 8: Ignore the new customer, the internal queue remain unchanged.\\\\n    2.  **Processing**: Hold the customer(first in the queue) for exactly 5 seconds. It is still in the queue.\\\\n    3.  **Handoff**: After 5 seconds, if the checkhair phase is available, send the customer to the Hair Inspection Phase. Otherwise, keep waiting until the checkhair phase is available. After the customer is sent, start to process the next customer in the queue.\\\\n\\\\n#### Hair Inspection Phase (Logic Name: `checkhair`)\\\\n* Role: The first step of the barber service. Acts as a coordinator between the reception and the cutting chair.\\\\n* Processing: 1 customer at a time, 7 seconds per customer (consultation time).\\\\n* Workflow:\\\\n    0. Initially, the module is in \"available\" state, ready for a new customer.\\\\n    1.  **Receive**: Accept customer from Reception Desk. It turns from available to busy. \\\\n    2.  **Process**: Hold customer for exactly 7 seconds.\\\\n    3.  **Forward**: Send customer to the *Hair Cutting Phase*.\\\\n    4.  **Coordination**: Wait for a \"done\" signal from the *Hair Cutting Phase*.\\\\n    5.  **Completion**: Upon receiving the \"done\" signal from the cutter, send a notification back to the *Reception Desk* indicating the full service is complete. ONLY AFTER this step does the module become \"available\" again to accept a new customer.\\\\n\\\\n#### Hair Cutting Phase (Logic Name: `cuthair`)\\\\n* Role: The execution step of the barber service.\\\\n* Processing: 1 customer at a time, 20 seconds per customer (cutting time).\\\\n* Workflow:\\\\n    1.  **Receive**: Accept customer from *Hair Inspection Phase*.\\\\n    2.  **Process**: Hold customer for exactly 20 seconds.\\\\n    3.  **Completion**: Signal back to the *Hair Inspection Phase* that cutting is finished.\\\\n\\\\n3. Simulation Constraints\\\\n* Time Unit: Seconds (1.0 = 1 second). All internal calculations must be in seconds.\\\\n* Clock: Starts at `0.0`.\\\\n* Concurrency: \\\\n    * Reception processes customers independently of the Barber.\\\\n    * The Barber (Inspection + Cutting) processes only one customer at a time.\\\\n    * New customers can pile up in the Reception queue (up to 8) while the Barber is busy.\\\\n\\', \\'args_input_output\\': \\'1. Command Line Interface\\\\nThe script must accept the following named arguments:\\\\n* `--simulation_time` (float): Total simulation time in seconds. Default: 1000000.0 (to make sure all requests are processed)\\\\n\\\\n2. Input Data Format (The Schedule)\\\\n* Structure: One event per line.\\\\n* Syntax: `HH:MM:SS:mm EventName`\\\\n* EventName: only `newcust`. \\\\n* **Example Content**:\\\\n    ```text\\\\n    08:00:00:00 newcust\\\\n    08:00:10:00 newcust\\\\n    ```\\\\n\\\\n3. Output Data Format (STDOUT)\\\\nThe system must emit a JSON Lines (JSONL) stream to `sys.stdout`. Every significant state change or message passed between modules must be logged as a valid JSON object.\\\\n\\\\n#### Record Types\\\\n\\\\n**Type A: State Change (`type: \"state\"`)**\\\\nEmitted whenever a tracked variable changes value within a module.\\\\n* `time` (float): Current simulation time.\\\\n* `type`: Literal string `\"state\"`.\\\\n* `model`: The instance name (specifically: \"reception\"`, `\"checkhair\"`, `\"cuthair\"`).\\\\n* `field`: The variable name being updated.\\\\n    * For Reception: `total customers num`: The current total number of customers in the reception desk.\\\\n    * For Inspection: `customer`: The current status of the customer being inspected. Value must be \"newcust\" (processing start) or \"done\" (customer finished cuthair).\\\\n    * For Cutting: `total customer done`: A cumulative counter of customers who have finished hair cutting.\\\\n* `value`: The new value (string or number).\\\\n\\\\n**Type B: Communication Event (`type: \"message\"`)**\\\\nEmitted whenever a module sends data/signals to another module.\\\\n* `time` (float): Current simulation time.\\\\n* `type`: Literal string `\"message\"`.\\\\n* `model`: The name of the sender.\\\\n* `port`: The specific communication channel name.\\\\n    * Reception output: `\"cust\"`\\\\n    * Inspection outputs: `\"to_cut\"`, `\"to_reception\"`\\\\n    * Cutting output: `\"out\"`\\\\n* `content`: Brief message. Must among [\"newcust\", \"done\"]\\\\n\\\\n#### Example Output Lines\\\\n```json\\\\n{\"time\": xxx, \"type\": \"state\", \"model\": \"reception\", \"field\": \"total customers\", \"value\": \"1\"}\\\\n{\"time\": xxx, \"type\": \"message\", \"model\": \"reception\", \"port\": \"cust\", \"content\": \"newcust\"}\\\\n```\\\\n\\'}' ancestors=[] siblings=[]"
+}
