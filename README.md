@@ -12,7 +12,7 @@ This repository is a standalone catalog of generated DEVS simulators and optiona
 - Use it to explore optional Godot scenes that animate simulator event traces.
 - Use it as a reference layout for packaging future simulator and visualization pairs.
 
-If you want the upstream generator that produced these simulator packages, see [DEVS-Gen](https://github.com/czyarl/devs_gen_code).
+If you want the upstream generator that produced these simulator packages, see our project page [DEVS-Gen](https://minds-thu.github.io/devs_gen/).
 
 ## Repository layout
 
