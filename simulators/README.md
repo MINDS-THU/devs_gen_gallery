@@ -11,20 +11,32 @@ simulators/<name>/
   godot/          # optional
 ```
 
-- `README.md` explains what the simulator is, how to run it, and whether a Godot visualization is available.
-- `simulator/` contains the self-contained generated package, including its original generated README, entrypoint, and `devs_project/` implementation.
+- `README.md` is the human-facing summary for that simulator item.
+- `simulator/` contains the runnable generated package, including its original generated README, entrypoint, and `devs_project/` implementation.
 - `godot/` is optional and contains a visualization project that subscribes to the simulator's event stream.
+
+## Expected structure of each simulator README
+
+Each simulator README should summarize the contract of the simulator itself rather than repeat generation details. At minimum, it should contain:
+
+1. A short description of the simulated system.
+2. The input interface:
+  - command-line arguments;
+  - stdin format, if the simulator consumes stdin.
+3. The output contract:
+  - the top-level output schema;
+  - the main required event families or final-state fields.
+4. A minimal local run example.
+5. A short note on repository contents:
+  - `simulator/` always;
+  - `godot/` only when a visualization is included.
 
 ## Available simulator items
 
-- `ABP` - Alternating Bit Protocol
-- `IOBS` - Island Observing Station
-- `OTrain` - Ottawa O-Train light rail system
-- `SA` - Strategic Airlift with Godot visualization
-- `SEIRD` - Epidemiological compartment model
-- `barbershop` - Barber shop queueing benchmark
-- `oft` - Offline file transfer benchmark
-
-The simulator packages in this repository are generated with DEVS-Gen from the separate implementation repository:
-
-- https://github.com/czyarl/devs_gen_code
+- `ABP` - Reliable stop-and-wait packet transfer with deterministic channel loss.
+- `IOBS` - Online banking authentication and transaction workflow.
+- `OTrain` - Single-train light rail simulation with passenger generation and station queues.
+- `SA` - Strategic airlift logistics with an optional Godot visualization.
+- `SEIRD` - SEIRD epidemic compartment model.
+- `barbershop` - Barbershop queueing workflow with reception, inspection, and cutting stages.
+- `oft` - Dropbox-like upload/download synchronization through a buffered server.
